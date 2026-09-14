@@ -4,7 +4,7 @@ use clap::Parser;
 use fs_err as fs;
 use rayon::prelude::*;
 use retoc::asset_conversion::{self, FZenPackageContext};
-use retoc::container_header::{EIoContainerHeaderVersion, StoreEntry};
+use retoc::container_header::EIoContainerHeaderVersion;
 use retoc::iostore::{IoStoreTrait, PackageInfo};
 use retoc::iostore_writer::IoStoreWriter;
 use retoc::legacy_asset::FSerializedAssetBundle;
@@ -544,13 +544,13 @@ mod raw {
     use retoc::{EIoStoreTocVersion, FIoChunkIdRaw};
 
     #[derive(Serialize, Deserialize)]
-pub(crate) struct RawIoManifest {
-    pub(crate) chunk_paths: HashMap<ChunkId, String>,
-    pub(crate) version: EIoStoreTocVersion,
-    pub(crate) mount_point: String,
-    pub(crate) container_header_version: Option<retoc::container_header::EIoContainerHeaderVersion>,
-    pub(crate) package_store_entries: HashMap<ChunkId, retoc::container_header::StoreEntry>,
-}
+    pub(crate) struct RawIoManifest {
+        pub(crate) chunk_paths: HashMap<ChunkId, String>,
+        pub(crate) version: EIoStoreTocVersion,
+        pub(crate) mount_point: String,
+        pub(crate) container_header_version: Option<retoc::container_header::EIoContainerHeaderVersion>,
+        pub(crate) package_store_entries: HashMap<ChunkId, retoc::container_header::StoreEntry>,
+    }
     #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub(crate) struct ChunkId(#[serde(serialize_with = "to_hex", deserialize_with = "from_hex")] pub(crate) FIoChunkIdRaw);
     impl From<FIoChunkIdRaw> for ChunkId {
@@ -587,27 +587,27 @@ fn action_unpack_raw(args: ActionUnpackRaw, config: Arc<Config>) -> Result<()> {
     fs::create_dir(&output)?;
     fs::create_dir(&chunks_dir)?;
 
-   let mut manifest = raw::RawIoManifest {
-    chunk_paths: Default::default(),
-    version: iostore.container_file_version().unwrap(),
-    mount_point: "../../../".to_string(),
-    container_header_version: iostore.container_header_version(),
-    package_store_entries: Default::default(),
-};
+    let mut manifest = raw::RawIoManifest {
+        chunk_paths: Default::default(),
+        version: iostore.container_file_version().unwrap(),
+        mount_point: "../../../".to_string(),
+        container_header_version: iostore.container_header_version(),
+        package_store_entries: Default::default(),
+    };
 
-for chunk in iostore.chunks() {
-    let data = chunk.read()?;
-    fs::write(chunks_dir.join(hex::encode(chunk.id().get_raw())), data)?;
-    if let Some(path) = chunk.path() {
-        manifest.chunk_paths.insert(chunk.id().get_raw().into(), path);
-    }
-    if chunk.id().get_chunk_type() == EIoChunkType::ExportBundleData {
-        let package_id = FPackageId(chunk.id().get_chunk_id());
-        if let Some(store_entry) = iostore.package_store_entry(package_id) {
-            manifest.package_store_entries.insert(chunk.id().get_raw().into(), store_entry);
+    for chunk in iostore.chunks() {
+        let data = chunk.read()?;
+        fs::write(chunks_dir.join(hex::encode(chunk.id().get_raw())), data)?;
+        if let Some(path) = chunk.path() {
+            manifest.chunk_paths.insert(chunk.id().get_raw().into(), path);
+        }
+        if chunk.id().get_chunk_type() == EIoChunkType::ExportBundleData {
+            let package_id = FPackageId(chunk.id().get_chunk_id());
+            if let Some(store_entry) = iostore.package_store_entry(package_id) {
+                manifest.package_store_entries.insert(chunk.id().get_raw().into(), store_entry);
+            }
         }
     }
-}
 
     serde_json::to_writer_pretty(BufWriter::new(fs::File::create(manifest_path)?), &manifest)?;
 
