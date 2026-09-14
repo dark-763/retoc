@@ -250,7 +250,12 @@ fn convert_legacy_import_to_object_index(builder: &mut ZenPackageBuilder, import
     // If this is a package import (full import name length is the same as package name), emit Null
     // Zen does not preserve Package imports, and they cannot be represented at all in terms of FPackageObjectIndex
     let is_package_import = package_name.len() == full_import_name.len();
-    if is_package_import {
+    // Also emit Null for anything nested under the /Engine/UnknownPackage placeholder - this
+    // represents content that was already unresolvable in the original shipped game data
+    // (genuinely missing, not something we can fix by resolving it), and treating it as a
+    // real package import causes incorrect dependency arc data and crashes in the real engine.
+    let is_unknown_package_placeholder = package_name.to_lowercase().contains("unknownpackage");
+    if is_package_import || is_unknown_package_placeholder {
         return Ok(FPackageObjectIndex::create_null());
     }
     let package_id = FPackageId::from_name(&package_name);
@@ -416,7 +421,7 @@ fn build_zen_export_map(builder: &mut ZenPackageBuilder) -> anyhow::Result<()> {
         let super_index = remap_package_index_reference(builder, object_export.super_index);
         let template_index = remap_package_index_reference(builder, object_export.template_index);
 
-        let gen_hash = (object_export.object_flags & EObjectFlags::Public as u32) != 0 || object_export.generate_public_hash;
+        let gen_hash = (object_export.object_flags & EObjectFlags::Public as u32) != 0 || object_export.generate_public_hash || builder.container_header_version <= EIoContainerHeaderVersion::Initial;
         let (export_package_name, full_export_name) = resolve_legacy_package_object(builder, FPackageIndex::create_export(export_index as u32))?;
 
         // Use global import index converted to the raw representation for legacy packages, and get_public_export_hash otherwise
@@ -485,6 +490,39 @@ struct ZenDependencyGraphNode {
     command_type: EExportCommandType,
 }
 
+static BUNDLE_LAYOUT: std::sync::OnceLock<HashMap<String, Vec<(u32, u32)>>> = std::sync::OnceLock::new();
+
+/// Разбивка пакета на бандлы экспортов, снятая с оригинального контейнера игры.
+/// Правило, по которому кукер UE4 делит пакет на несколько бандлов, здесь не
+/// воспроизводится - готовая разбивка переносится из эталона, как и load_order.
+/// Путь к JSON задаётся переменной окружения RETOC_BUNDLE_LAYOUT.
+fn original_bundle_layout(package_name: &str) -> Option<&'static Vec<(u32, u32)>> {
+    let map = BUNDLE_LAYOUT.get_or_init(|| {
+        let path = std::env::var("RETOC_BUNDLE_LAYOUT").unwrap_or_default();
+        if path.is_empty() {
+            return HashMap::new();
+        }
+        let data = std::fs::read_to_string(&path).unwrap_or_default();
+        let raw: HashMap<String, Vec<Vec<u32>>> = serde_json::from_str(&data).unwrap_or_default();
+        raw.into_iter()
+            .map(|(k, v)| {
+                let key = k
+                    .trim_end_matches(".uasset")
+                    .trim_end_matches(".umap")
+                    .to_lowercase();
+                let hdrs = v.into_iter().filter(|p| p.len() == 2).map(|p| (p[0], p[1])).collect();
+                (key, hdrs)
+            })
+            .collect()
+    });
+    if map.is_empty() {
+        return None;
+    }
+    // Ключи в файле вида "SRTE/Content/A/.../Name", имя пакета - "/Game/A/.../Name"
+    let key = package_name.replacen("/Game", "SRTE/Content", 1).to_lowercase();
+    map.get(&key)
+}
+
 fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_load_order: &[ZenExportGraphNode], export_dependencies: &HashMap<ZenDependencyGraphNode, Vec<ZenDependencyGraphNode>>) {
     let mut current_export_bundle_header_index: i64 = -1;
     let mut current_export_offset: u64 = 0;
@@ -543,15 +581,71 @@ fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_l
         }
 
         // Export bundles end at a public export with an export hash. So if this is a public export, close the current bundle
-        if is_public_export {
+        // NOTE: legacy UE4 (Initial) containers emit exactly ONE export bundle per package - verified by
+        // byte-comparing original shipped chunks (1 bundle / N*2 entries) against regenerated ones
+        // (N*2 bundles / 1 entry each). Closing per public export there produces a structurally different
+        // package than the original cook, which breaks StoreEntry.export_bundle_count and every
+        // cross-package bundle index that refers to it.
+        if is_public_export && builder.container_header_version > EIoContainerHeaderVersion::Initial {
             current_export_bundle_header_index = -1;
+        }
+    }
+
+    // Если для пакета известна разбивка бандлов из оригинального контейнера - применяем её.
+    // Последовательность записей Create/Serialize у нас совпадает с оригиналом побайтово,
+    // поэтому точки разреза переносятся напрямую, без попытки вывести правило кукера.
+    if builder.container_header_version <= EIoContainerHeaderVersion::Initial {
+        if let Some(layout) = original_bundle_layout(&builder.package_name) {
+            let total = builder.zen_package.export_bundle_entries.len() as u32;
+            let sum: u32 = layout.iter().map(|(_, c)| *c).sum();
+            if sum == total {
+                // Смещение данных для каждого бандла - сумма размеров экспортов,
+                // сериализованных в предыдущих бандлах. Поле не пишется в файл для
+                // версии Initial, но retoc сверяет его с фактическим размещением.
+                let mut offsets: Vec<u64> = Vec::with_capacity(builder.zen_package.export_bundle_entries.len() + 1);
+                let mut running: u64 = 0;
+                for entry in &builder.zen_package.export_bundle_entries {
+                    offsets.push(running);
+                    if entry.command_type == EExportCommandType::Serialize {
+                        running += builder.zen_package.export_map[entry.local_export_index as usize].cooked_serial_size;
+                    }
+                }
+                offsets.push(running);
+
+                let headers: Vec<FExportBundleHeader> = layout
+                    .iter()
+                    .map(|(first, count)| FExportBundleHeader {
+                        serial_offset: offsets[*first as usize],
+                        first_entry_index: *first,
+                        entry_count: *count,
+                    })
+                    .collect();
+                builder.zen_package.export_bundle_headers = headers;
+
+                // Карта "узел графа -> индекс бандла" строилась выше по старой схеме
+                // (один бандл на пакет). После переноса разбивки её нужно пересобрать,
+                // иначе внешние арки получат to_bundle = 0 вместо настоящего индекса.
+                for (bundle_index, (first, count)) in layout.iter().enumerate() {
+                    for i in *first..(*first + *count) {
+                        let entry = builder.zen_package.export_bundle_entries[i as usize];
+                        let node = ZenDependencyGraphNode {
+                            package_index: FPackageIndex::create_export(entry.local_export_index),
+                            command_type: entry.command_type,
+                        };
+                        export_to_bundle_map.insert(node, bundle_index);
+                    }
+                }
+            }
         }
     }
 
     // Used to avoid adding duplicate dependencies between export bundles and other export bundles/imports
     let mut internal_dependency_arcs: HashSet<FInternalDependencyArc> = HashSet::new();
     let mut external_dependency_arcs: HashSet<FExternalDependencyArc> = HashSet::new();
-    let mut legacy_dependency_arcs: HashSet<(FPackageId, FInternalDependencyArc)> = HashSet::new();
+    // Ключ дедупликации - (пакет, целевой бандл). from_export_bundle_index здесь ещё
+    // не настоящий индекс, а уникальный номер для последующей подстановки, поэтому
+    // включать его в ключ нельзя: дубли не распознаются и арки размножаются.
+    let mut legacy_dependency_arcs: HashSet<(FPackageId, i32)> = HashSet::new();
 
     // Function to create export dependency arcs to the export's export bundle from another export's export bundle, or from an entry in the import map
     let mut create_dependency_arc_from_node = |to_export_bundle_index: i32, dependency_node: &ZenDependencyGraphNode, mut_builder: &mut ZenPackageBuilder| {
@@ -596,36 +690,45 @@ fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_l
                     }
                 } else {
                     let imported_package_id = *mut_builder.import_to_package_id_lookup.get(&package_object_import).unwrap();
-                    let imported_package_index = *mut_builder.package_import_lookup.get(&imported_package_id).unwrap() as usize;
 
-                    // Legacy UE4 graph data will only map the export bundle index in this package to export bundle index in the imported package
-                    // This requires knowledge of the export bundle layout of another package, which we do not have if fix-up is not possible.
-                    // If we are intending to fix up the serialized data later though, write a placeholder value and emit the information necessary for the fixup
-                    let from_export_bundle_index: i32 = if mut_builder.fixup_legacy_external_arcs {
-                        let current_fixup_id = mut_builder.legacy_external_arc_counter;
-                        let full_import_name = mut_builder.debug_full_package_object_names.get(&dependency_node.package_index).cloned();
+                    // Skip references to the /Engine/UnknownPackage placeholder - this dependency was already
+                    // unresolvable in the original shipped game data (content missing entirely), and any
+                    // "fixed" value (including -1 or 0) risks an incorrect load order or a crash in the real engine.
+                    let full_import_name_check = mut_builder.debug_full_package_object_names.get(&dependency_node.package_index).cloned();
+                    let is_unknown_package = full_import_name_check.as_deref().map(|n| n.to_lowercase().contains("unknownpackage")).unwrap_or(false);
 
-                        let fixup_data = ZenLegacyPackageExternalArcFixupData {
-                            fixup_from_bundle_id: current_fixup_id,
-                            from_package_id: imported_package_id,
-                            from_import_index: package_object_import,
-                            from_command_type,
-                            debug_full_import_name: full_import_name,
+                    if !is_unknown_package {
+                        let imported_package_index = *mut_builder.package_import_lookup.get(&imported_package_id).unwrap() as usize;
+
+                        // Legacy UE4 graph data will only map the export bundle index in this package to export bundle index in the imported package
+                        // This requires knowledge of the export bundle layout of another package, which we do not have if fix-up is not possible.
+                        // If we are intending to fix up the serialized data later though, write a placeholder value and emit the information necessary for the fixup
+                        let from_export_bundle_index: i32 = if mut_builder.fixup_legacy_external_arcs {
+                            let current_fixup_id = mut_builder.legacy_external_arc_counter;
+                            let full_import_name = mut_builder.debug_full_package_object_names.get(&dependency_node.package_index).cloned();
+
+                            let fixup_data = ZenLegacyPackageExternalArcFixupData {
+                                fixup_from_bundle_id: current_fixup_id,
+                                from_package_id: imported_package_id,
+                                from_import_index: package_object_import,
+                                from_command_type,
+                                debug_full_import_name: full_import_name,
+                            };
+                            // Add the fixup data to the hash map and increment the counter, and write current fixup ID as the bundle index
+                            mut_builder.legacy_external_arc_fixup_data.push(fixup_data);
+                            mut_builder.legacy_external_arc_counter += 1;
+                            current_fixup_id
+                        } else {
+                            // Assume the first index because there is only one export bundle because export bundles are per package and there is only ever one package per asset.
+                            0
                         };
-                        // Add the fixup data to the hash map and increment the counter, and write current fixup ID as the bundle index
-                        mut_builder.legacy_external_arc_fixup_data.push(fixup_data);
-                        mut_builder.legacy_external_arc_counter += 1;
-                        current_fixup_id
-                    } else {
-                        // Assume the first index because there is only one export bundle because export bundles are per package and there is only ever one package per asset.
-                        0
-                    };
 
-                    // Prevent adding duplicate dependencies on the packages
-                    let legacy_dependency_arc = FInternalDependencyArc { from_export_bundle_index, to_export_bundle_index };
-                    if !legacy_dependency_arcs.contains(&(imported_package_id, legacy_dependency_arc)) {
-                        legacy_dependency_arcs.insert((imported_package_id, legacy_dependency_arc));
-                        mut_builder.zen_package.external_package_dependencies[imported_package_index].legacy_dependency_arcs.push(legacy_dependency_arc);
+                        // Prevent adding duplicate dependencies on the packages
+                        let legacy_dependency_arc = FInternalDependencyArc { from_export_bundle_index, to_export_bundle_index };
+                        if !legacy_dependency_arcs.contains(&(imported_package_id, to_export_bundle_index)) {
+                            legacy_dependency_arcs.insert((imported_package_id, to_export_bundle_index));
+                            mut_builder.zen_package.external_package_dependencies[imported_package_index].legacy_dependency_arcs.push(legacy_dependency_arc);
+                        }
                     }
                 }
             }
@@ -661,6 +764,27 @@ fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_l
         }
         for export_serialize_dependency in export_dependencies.get(&export_serialize_node).unwrap_or(&Vec::new()) {
             create_dependency_arc_from_node(export_serialize_bundle_index as i32, export_serialize_dependency, builder);
+        }
+    }
+
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("D:\\GameLoc-new\\bundle_counts.csv") {
+        let _ = writeln!(f, "{},{}", builder.package_name, builder.zen_package.export_bundle_headers.len());
+    }
+    if builder.package_name.contains("QT_Main") {
+        if let Ok(mut f) = std::fs::File::create("D:\\GameLoc-new\\qtmain_detail.txt") {
+            let _ = writeln!(f, "package_name={}", builder.package_name);
+            let _ = writeln!(f, "own_bundle_count={}", builder.zen_package.export_bundle_headers.len());
+            let _ = writeln!(f, "imported_packages_in_order:");
+            for (idx, pkg_id) in builder.zen_package.imported_packages.iter().enumerate() {
+                let _ = writeln!(f, "  [{}] {:?}", idx, pkg_id);
+            }
+            let _ = writeln!(f, "legacy_arcs:");
+            for (idx, dep) in builder.zen_package.external_package_dependencies.iter().enumerate() {
+                for arc in &dep.legacy_dependency_arcs {
+                    let _ = writeln!(f, "  pkg_idx={} from_package_id={:?} from_bundle={} to_bundle={}", idx, dep.from_package_id, arc.from_export_bundle_index, arc.to_export_bundle_index);
+                }
+            }
         }
     }
 }
@@ -1216,8 +1340,20 @@ impl ConvertedZenAssetBundle {
                 );
 
                 // We found the export bundle this dependency maps to
+                if self.package_name.contains("QT_Main") {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("D:\\GameLoc-new\\qtmain_fixup.txt") {
+                        let _ = writeln!(f, "RESOLVED: from_package={:?} from_import_index={} target_bundle={}", fixup_data.from_package_id, fixup_data.from_import_index, export_bundle_mapping.export_bundle_index);
+                    }
+                }
                 export_bundle_mapping.export_bundle_index
             } else {
+                if self.package_name.contains("QT_Main") {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("D:\\GameLoc-new\\qtmain_fixup.txt") {
+                        let _ = writeln!(f, "NOT FOUND: from_package_id={:?}", fixup_data.from_package_id);
+                    }
+                }
                 // This import is not found in the global package lookup, so assume it is external and use -1 as a value meaning "last export bundle in the package"
                 -1
             };
