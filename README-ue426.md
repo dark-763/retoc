@@ -1,3 +1,17 @@
+> **Which branch to use**
+>
+> Build from **`ue426-repack`** — that branch carries all nine fixes and is the
+> working version. The **`pack-raw-compression`** branch exists solely as a
+> clean, single-purpose branch for the upstream pull request: it contains only
+> the compression change, on top of an otherwise unmodified `master`.
+>
+> Building from `pack-raw-compression` will produce a binary that fails
+> conversion with `Failed to find export in the package ...`, because the import
+> fix-ups are not part of that branch.
+
+# Nine fixes for repacking UE 4.26 IoStore containers
+
+
 # Nine fixes for repacking UE 4.26 IoStore containers
 
 This fork of [retoc](https://github.com/trumank/retoc) makes it possible not
