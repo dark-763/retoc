@@ -699,10 +699,20 @@ fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_l
     // Used to avoid adding duplicate dependencies between export bundles and other export bundles/imports
     let mut internal_dependency_arcs: HashSet<FInternalDependencyArc> = HashSet::new();
     let mut external_dependency_arcs: HashSet<FExternalDependencyArc> = HashSet::new();
-    // Ключ дедупликации - (пакет, целевой бандл). from_export_bundle_index здесь ещё
-    // не настоящий индекс, а уникальный номер для последующей подстановки, поэтому
-    // включать его в ключ нельзя: дубли не распознаются и арки размножаются.
-    let mut legacy_dependency_arcs: HashSet<(FPackageId, i32)> = HashSet::new();
+    // Ключ дедупликации - (откуда именно в исходном пакете, куда в этом).
+    // "Откуда" - это сам импортируемый объект (package_object_import) и тип
+    // команды (Create/Serialize), а НЕ from_export_bundle_index: на этом
+    // этапе это ещё не настоящий индекс бандла, а одноразовый номер для
+    // последующей подстановки (см. fixup_legacy_external_arcs), уникальный
+    // для каждого вызова - включать его в ключ нельзя, дубли не распознаются
+    // и арки размножаются (это была правка №8 из девяти).
+    //
+    // Раньше ключ был (пакет, куда) без "откуда" вообще - это тоже неверно:
+    // после подстановки два РАЗНЫХ импорта одного пакета могут оказаться в
+    // РАЗНЫХ бандлах источника, но вести в один и тот же бандл этого пакета
+    // (см. TASK.md, проверка дедупликации дуг) - такой ключ схлопывал их в
+    // одну дугу, хотя в оригинале это два разных (from, to) с одинаковым to.
+    let mut legacy_dependency_arcs: HashSet<(FPackageObjectIndex, EExportCommandType, i32)> = HashSet::new();
 
     // Function to create export dependency arcs to the export's export bundle from another export's export bundle, or from an entry in the import map
     let mut create_dependency_arc_from_node = |to_export_bundle_index: i32, dependency_node: &ZenDependencyGraphNode, mut_builder: &mut ZenPackageBuilder| {
@@ -782,8 +792,9 @@ fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_l
 
                         // Prevent adding duplicate dependencies on the packages
                         let legacy_dependency_arc = FInternalDependencyArc { from_export_bundle_index, to_export_bundle_index };
-                        if !legacy_dependency_arcs.contains(&(imported_package_id, to_export_bundle_index)) {
-                            legacy_dependency_arcs.insert((imported_package_id, to_export_bundle_index));
+                        let dedup_key = (package_object_import, from_command_type, to_export_bundle_index);
+                        if !legacy_dependency_arcs.contains(&dedup_key) {
+                            legacy_dependency_arcs.insert(dedup_key);
                             mut_builder.zen_package.external_package_dependencies[imported_package_index].legacy_dependency_arcs.push(legacy_dependency_arc);
                         }
                     }
@@ -1376,20 +1387,8 @@ impl ConvertedZenAssetBundle {
                 );
 
                 // We found the export bundle this dependency maps to
-                if self.package_name.contains("QT_Main") {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("D:\\GameLoc-new\\qtmain_fixup.txt") {
-                        let _ = writeln!(f, "RESOLVED: from_package={:?} from_import_index={} target_bundle={}", fixup_data.from_package_id, fixup_data.from_import_index, export_bundle_mapping.export_bundle_index);
-                    }
-                }
                 export_bundle_mapping.export_bundle_index
             } else {
-                if self.package_name.contains("QT_Main") {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("D:\\GameLoc-new\\qtmain_fixup.txt") {
-                        let _ = writeln!(f, "NOT FOUND: from_package_id={:?}", fixup_data.from_package_id);
-                    }
-                }
                 // This import is not found in the global package lookup, so assume it is external and use -1 as a value meaning "last export bundle in the package"
                 -1
             };
@@ -1399,6 +1398,96 @@ impl ConvertedZenAssetBundle {
             package_buffer_writer.seek(SeekFrom::Start(*legacy_serialized_offset))?;
             package_buffer_writer.ser(&result_from_bundle_index)?;
         }
+
+        // Only now, with every placeholder resolved to its real source bundle index,
+        // can arcs that turned out identical (same source bundle, same target bundle,
+        // within the same imported package) actually be recognized as duplicates and
+        // collapsed - see TASK.md for why this can't be done any earlier.
+        if !self.legacy_external_arc_serialized_offsets.is_empty() {
+            self.dedup_legacy_dependency_arcs()?;
+        }
+        Ok(())
+    }
+
+    /// Removes exact-duplicate (from, to) legacy dependency arcs within each imported
+    /// package's block of the graph region, now that `from_export_bundle_index` has
+    /// been resolved to its real value by the fixup loop above. Two arcs created from
+    /// different imports of the same external package can easily resolve to the exact
+    /// same (from, to) pair once we know which bundle of that package they each landed
+    /// in - the original cooker only ever stores such a pair once (see TASK.md, "arc
+    /// dedup" investigation).
+    ///
+    /// Operates directly on the already-serialized `package_buffer` bytes rather than
+    /// on the (long gone, by this point) `ZenPackageHeader` struct: this pass runs once
+    /// per package, after every other package has already been converted and
+    /// serialized too, so redoing a full struct-level serialize here is unnecessary.
+    /// The graph region is always the last part of the header for container header
+    /// versions <= Initial (see `FZenPackageHeader::serialize`), so shrinking it only
+    /// requires splicing bytes out of the buffer and patching `graph_data_size` in the
+    /// package summary - nothing before or after it needs to move or change.
+    fn dedup_legacy_dependency_arcs(&mut self) -> anyhow::Result<()> {
+        // Byte offset of `graph_data_offset`/`graph_data_size` within FZenPackageSummary
+        // for container header versions <= Initial: name (FMappedName, 8) + source_name
+        // (FMappedName, 8) + package_flags (4) + cooked_header_size (4) + 4 name map
+        // offset/size fields (16) + import_map_offset (4) + export_map_offset (4) +
+        // export_bundle_entries_offset (4) + graph_data_offset (4) = 56, then
+        // graph_data_size follows immediately.
+        const GRAPH_DATA_OFFSET_FIELD_POS: u64 = 52;
+        const GRAPH_DATA_SIZE_FIELD_POS: u64 = 56;
+
+        let (graph_data_offset, graph_data_size): (i32, i32) = {
+            let mut reader = Cursor::new(&self.package_buffer);
+            reader.seek(SeekFrom::Start(GRAPH_DATA_OFFSET_FIELD_POS))?;
+            (reader.de()?, reader.de()?)
+        };
+        if graph_data_size < 4 {
+            return Ok(());
+        }
+        let graph_start = graph_data_offset as usize;
+        let graph_end = graph_start + graph_data_size as usize;
+
+        let mut reader = Cursor::new(&self.package_buffer[graph_start..graph_end]);
+        let package_count: u32 = reader.de()?;
+
+        let mut new_graph_data: Vec<u8> = Vec::with_capacity(graph_data_size as usize);
+        new_graph_data.ser(&package_count)?;
+        for _ in 0..package_count {
+            let package_id: FPackageId = reader.de()?;
+            let arc_count: u32 = reader.de()?;
+            let mut arcs: Vec<(i32, i32)> = Vec::with_capacity(arc_count as usize);
+            for _ in 0..arc_count {
+                arcs.push((reader.de()?, reader.de()?));
+            }
+
+            // Deduplicate while preserving first-seen order, so unrelated arcs that
+            // happen to already be unique keep their original relative position
+            let mut seen: HashSet<(i32, i32)> = HashSet::with_capacity(arcs.len());
+            arcs.retain(|arc| seen.insert(*arc));
+
+            new_graph_data.ser(&package_id)?;
+            new_graph_data.ser(&(arcs.len() as u32))?;
+            for (from, to) in arcs {
+                new_graph_data.ser(&from)?;
+                new_graph_data.ser(&to)?;
+            }
+        }
+
+        let bytes_removed = graph_data_size as usize - new_graph_data.len();
+        if bytes_removed == 0 {
+            return Ok(());
+        }
+
+        self.package_buffer.splice(graph_start..graph_end, new_graph_data.iter().copied());
+
+        let new_graph_data_size = new_graph_data.len() as i32;
+        let mut writer = Cursor::new(&mut self.package_buffer);
+        writer.seek(SeekFrom::Start(GRAPH_DATA_SIZE_FIELD_POS))?;
+        writer.ser(&new_graph_data_size)?;
+
+        // header_size (graph_data_offset + graph_data_size) shrank by the same amount,
+        // and export_bundles_size is header_size + sum of export sizes - see
+        // FZenPackageHeader::serialize
+        self.store_entry.export_bundles_size -= bytes_removed as u64;
         Ok(())
     }
 
