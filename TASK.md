@@ -301,7 +301,12 @@ Initial to-zen`) - см. историю сессии, в частности dump
 Outer/class/позиции конкретного пакета) и verify_final2.py (сверка целого
 пересобранного контейнера с bundle_layout.json).
 
-## imported_packages (правка №9, ветка imported-order)
+## imported_packages (правка №10, ветка imported-order)
+
+Нумерация: компрессия в pack-raw уже занимает №9 в README-ue426.md/
+PATCHES-en.md (была реализована раньше, в ветке ue426-repack) - эта правка
+десятая по счёту, не девятая (в первом коммите на этой ветке ошибочно
+назвал её "fix 9", в документации и далее в TASK.md - "fix 10").
 
 ### Задача
 

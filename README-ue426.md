@@ -9,10 +9,10 @@
 > conversion with `Failed to find export in the package ...`, because the import
 > fix-ups are not part of that branch.
 
-# Nine fixes for repacking UE 4.26 IoStore containers
+# Ten fixes for repacking UE 4.26 IoStore containers
 
 
-# Nine fixes for repacking UE 4.26 IoStore containers
+# Ten fixes for repacking UE 4.26 IoStore containers
 
 This fork of [retoc](https://github.com/trumank/retoc) makes it possible not
 just to read an IoStore container but to rebuild one the engine will accept.
@@ -56,13 +56,42 @@ manifest, `unpack-raw` now preserves them, and `pack-raw` calls
 This placeholder appears whenever `to-legacy` cannot resolve an import.
 References to it now resolve to `Null` instead of being chased further.
 
-## 5. External arc block sorting
+## 5. External arc block sorting, and `imported_packages` ordering
 
-`zen.rs`
+`zen.rs`, `zen_asset_conversion.rs`
 
-The cooker sorts external arc blocks by `FPackageId`. It does **not** sort
-`imported_packages` in `StoreEntry` — conflating the two produces a graph the
-loader disagrees with.
+The cooker sorts external arc blocks by `FPackageId` (`non_empty_dependencies.sort_by_key`
+in `zen.rs`) — conflating that with `imported_packages` order produces a graph
+the loader disagrees with, so the two are kept independent.
+
+An earlier version of this fix concluded `imported_packages` itself isn't
+sorted at all, based on `FPackageId` order not matching the original. That
+conclusion was wrong — checked directly against the original container's
+`StoreEntry.imported_packages` across all 7337 packages with more than one
+import, with no rebuild involved:
+
+| ordering tried | exact matches |
+|---|---|
+| `FPackageId` ascending / descending | 18.0% / 10.0% |
+| global `load_order` of the imported package, ascending / descending | 7.9% / 21.0% |
+| path length | 22.2% |
+| basename only (no path) | 36.8% |
+| order of first reference while walking exports 0..N (same traversal that builds dependency arcs) | worse than doing nothing at all |
+| **imported package's own name, case-insensitive, alphabetical** | **98.6%** |
+
+Case-insensitive name order wins by a wide margin. It's implemented in
+`build_zen_dependency_bundles_legacy`: `imported_package_names` — previously
+only populated for the >Initial (UE5.0+) import path — is now populated for
+legacy (<= Initial) imports too, purely as a sort key (it isn't serialized
+for this container header version, see fix 10, so this has no on-disk effect
+beyond the reorder). `imported_packages`, `imported_package_names` and
+`external_package_dependencies` are then reordered together by one stable
+sort. This is safe regardless of what the arc code does with these arrays:
+dependency arcs address packages by ID or by (source package, import index),
+never by position in these arrays.
+
+The remaining ~1.4% and the composition question (does `imported_packages`
+ever disagree in *content*, not just order) are covered in fix 10.
 
 ## 6. `export_bundles_size` was never computed
 
@@ -179,6 +208,70 @@ RETOC_COMPRESSION=Zlib
 Result on the same container: 9.62 GB, and a `pack-raw` → `unpack-raw` round
 trip reproduces the store entries exactly.
 
+## 10. `imported_packages` order and composition
+
+`zen_asset_conversion.rs`, `asset_conversion.rs`
+
+Fix 5 covers the ordering rule itself and how it was found. This is the rest
+of that investigation: what fraction of `StoreEntry.imported_packages`
+mismatches were ever about *order* rather than *content*, what's left after
+the ordering fix, and one narrow, separate bug the investigation surfaced.
+
+Checked against the full 17095-package project (`to-zen` without
+`RETOC_BUNDLE_LAYOUT`): before the fix 5 reorder, 3625 packages had an
+`imported_packages` list that didn't match the original. Of those, 3618 had
+the exact same set of packages, just a different order — only 7 actually
+disagreed on *which* packages are listed, always the same shape: the
+original has one package we never emit.
+
+After the fix 5 reorder, mismatches drop to 93 (86 order, still the same 7
+composition) — 99.46% of the project exact instead of 78.8%. Both the 86 and
+the 7 are understood, at different depths:
+
+**The 86 remaining order mismatches** aren't uniform. 55 fit a further
+pattern: the original pulls exactly one package to the front, ahead of the
+alphabetical rest. In every case looked at, that package plausibly reads as
+a Blueprint's parent class or a similar structural dependency (e.g.
+`ItemConditions/Asset.uasset`, the most frequent offender at 47 occurrences,
+fits as a base class for several quest-interaction Blueprints) — consistent
+with, but not confirmed as, "the class/parent import always gets position 0"
+(confirming it would mean cross-referencing `class_index`/`super_index` on
+the actual exports, not done here). The other 31 preserve dense clusters of
+related sub-imports as a block (e.g. every `AF_Pose_*`/`AF_Additive_*`
+animation pose import stays adjacent in both original and ours, just as a
+block sitting in a different position in the list) — suggestive of Blueprint
+component/graph-node order rather than a flat alphabetical rule. Not pursued
+further: 31 packages out of 17095 (0.18%).
+
+**The 7 composition mismatches** turned out to be a genuinely separate,
+deeper issue, not a corollary of the ordering question. `asset_conversion.rs`
+(`resolve_package_import_internal_legacy`) shows that for
+`container_header_version <= Initial`, resolving *which* imported package an
+import belongs to is done by search, not by index: it iterates every package
+in `imported_packages` and looks for a matching
+`legacy_global_import_index()` on one of that package's exports. That means
+`imported_packages` for this header version isn't required to correspond 1:1
+with anything in `import_map` at all — the original cooker can list a
+package here purely as a recorded dependency, with no import table entry
+that points at it specifically. Confirmed experimentally: adding code on the
+`to-zen` side to also register such "bare" package-only imports (import
+table entries whose full name is just the package name, with nothing under
+it) had zero effect on any of the 7 - the entry these packages are missing
+isn't a bare import either, it has no import table entry at all by the time
+`to-zen` sees the legacy asset. The loss happens earlier, during
+`to-legacy`: there's nothing in the source zen package's `import_map` to
+reconstruct it from. A real fix would mean synthesizing a synthetic import
+table entry during `to-legacy`, informed directly by the source container's
+own `imported_packages` list, in the opposite direction and a different file
+from this investigation - not done here, for 7 packages out of 17095 (0.04%,
+none of which are in this project's actual translation patch set).
+
+The reorder itself only touches `imported_packages`,
+`imported_package_names` and `external_package_dependencies` in memory - it
+was checked not to move anything that matters on disk: `export_count`,
+`export_bundle_count` and graph-region byte-for-byte match rate (92.75%) are
+identical before and after.
+
 ---
 
 ## Known gaps
@@ -193,6 +286,10 @@ out the cooker's rule; if anyone knows it, I would like to hear.
 keyed on an index inversion — see fix 7). `RETOC_BUNDLE_LAYOUT` covers all of
 them as a fallback when the original container's layout is available.
 
+**`imported_packages` is still wrong for 93 packages** out of 17095 (86
+order, 7 composition) — see fix 10 for what's understood about both and why
+neither was pursued further.
+
 ## Verifying a rebuild
 
 Compare the unpacked rebuild against the unpacked original:
@@ -205,4 +302,5 @@ Compare the unpacked rebuild against the unpacked original:
   exceptions from fix 7 (plus their import-cascade effect on graph arcs);
 * `export_bundles_size` will differ on exactly the packages you modified if the
   replacement strings differ in length — that is expected;
-* `imported_packages` may differ in ordering only (see fix 5).
+* `imported_packages` should match exactly on all but the 93 known exceptions
+  (see fix 10).
