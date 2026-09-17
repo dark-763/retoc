@@ -279,6 +279,10 @@ fn convert_legacy_import_to_object_index(builder: &mut ZenPackageBuilder, import
         if let std::collections::hash_map::Entry::Vacant(e) = builder.package_import_lookup.entry(package_id) {
             let package_import_index = builder.zen_package.imported_packages.len() as u32;
             builder.zen_package.imported_packages.push(package_id);
+            // Not serialized for this container header version (see FZenPackageHeader::serialize),
+            // but kept as the sort key for reordering imported_packages - see the reorder pass at
+            // the end of build_zen_dependency_bundles_legacy.
+            builder.zen_package.imported_package_names.push(package_name.to_string());
             e.insert(package_import_index);
         }
 
@@ -833,6 +837,35 @@ fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_l
         for export_serialize_dependency in export_dependencies.get(&export_serialize_node).unwrap_or(&Vec::new()) {
             create_dependency_arc_from_node(export_serialize_bundle_index as i32, export_serialize_dependency, builder);
         }
+    }
+
+    // Reorder imported_packages (and the parallel imported_package_names/external_package_dependencies
+    // arrays) alphabetically by the imported package's own name, case-insensitive, instead of leaving
+    // them in the order they first appear in the legacy import table. Checked directly against the
+    // original container's StoreEntry.imported_packages (7337 multi-import packages, no rebuild
+    // involved): case-insensitive name order reproduces the original order exactly on 98.6% of them,
+    // dwarfing every other ordering tried (package ID ascending/descending, global load order
+    // ascending/descending, path length, basename alone: all under 37%) - see TASK.md,
+    // "imported_packages order" section, for the full comparison and the remaining ~1.4% that don't
+    // fit any tested rule.
+    //
+    // This only reshuffles bookkeeping arrays specific to this package - external and legacy
+    // dependency arcs reference packages by ID or by (source package, import index), never by
+    // position in these arrays, and graph blocks are independently sorted by package ID at
+    // serialization time (see `non_empty_dependencies.sort_by_key` in zen.rs) - so this cannot
+    // affect either.
+    {
+        let mut order: Vec<usize> = (0..builder.zen_package.imported_packages.len()).collect();
+        let imported_package_names = &builder.zen_package.imported_package_names;
+        order.sort_by(|&a, &b| imported_package_names[a].to_lowercase().cmp(&imported_package_names[b].to_lowercase()));
+
+        let old_imported_packages = std::mem::take(&mut builder.zen_package.imported_packages);
+        let old_imported_package_names = std::mem::take(&mut builder.zen_package.imported_package_names);
+        let old_external_package_dependencies = std::mem::take(&mut builder.zen_package.external_package_dependencies);
+
+        builder.zen_package.imported_packages = order.iter().map(|&i| old_imported_packages[i]).collect();
+        builder.zen_package.imported_package_names = order.iter().map(|&i| old_imported_package_names[i].clone()).collect();
+        builder.zen_package.external_package_dependencies = order.into_iter().map(|i| old_external_package_dependencies[i].clone()).collect();
     }
 }
 
