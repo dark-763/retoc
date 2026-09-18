@@ -605,9 +605,12 @@ fn compute_bundle_layout_cuts(export_load_order: &[ZenExportGraphNode], wide: bo
 /// narrow rule's Create-only condition misses the real boundary - there is no way to
 /// tell, from this package's own data alone, whether the narrow or the wide count (or
 /// neither) is actually correct; only the original container or RETOC_BUNDLE_LAYOUT
-/// can settle it. A wrong bundle count is not cosmetic: it has been confirmed (see
-/// TASK.md, "Опыт состоялся") to make the game hang on startup with no crash and no
-/// log, so this is worth surfacing even though it can't be resolved automatically.
+/// can settle it. A wrong bundle count is not cosmetic: two builds differing in
+/// nothing but `export_bundle_count` on ten packages were run against the game, and
+/// the one with the computed layout hung on startup with no crash and no log while
+/// the one with `RETOC_BUNDLE_LAYOUT` played normally (see TASK.md, "Журнал опыта:
+/// сборка №2"). So this is worth surfacing even though it can't be resolved
+/// automatically.
 ///
 /// This is a weak, partial signal, not a detector: measured on the full 17095-package
 /// project without RETOC_BUNDLE_LAYOUT, it flagged 12 packages, of which 7 were

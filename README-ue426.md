@@ -109,25 +109,44 @@ The field was left unfilled. It is `header_size` plus the sum of
 
 `zen_asset_conversion.rs`, `compute_bundle_layout`
 
-> **Keep supplying `RETOC_BUNDLE_LAYOUT` for shipping builds — but the
-> evidence behind that advice is confounded and is being re-examined.**
-> It rests on one experiment (see `TASK.md`): a build with the computed
-> layout and no JSON hung the game at startup — no crash, no error, no
-> log, just "not responding" — while an otherwise identical build with the
-> JSON launched and ran. Both of those builds, however, predate the
-> `pack-raw` container-header fix (patch 12), so in both of them the engine
-> read the *original* container's header while loading *our* package bytes.
-> The header announced the original bundle count for packages whose data we
-> had rebuilt with a different one, and no build without the JSON could have
-> avoided that disagreement regardless of how good the computed rule was.
-> The JSON may therefore have been curing a mismatch between two layers
-> rather than a wrong layout. With patch 12 in place both layers come from
-> us and agree by construction, so the computed rule may well stand on its
-> own; that is now a decidable experiment and has not been run yet. Either
-> way, **launch the actual game before shipping** — retoc's own tooling
-> cannot detect a wrong bundle count (see the known-gaps note on
+> **`RETOC_BUNDLE_LAYOUT` is required for shipping builds, not optional.**
+> Established by a controlled pair of builds (see `TASK.md`), verified on
+> one game — 17095 packages, UE 4.26.2. Both builds used the same code, the
+> same pipeline and the same container-header fix (patch 12), so the engine
+> read our own header in both. Measured against a clean unpack of the
+> original, they were identical on `load_order`, `export_count`,
+> `export_bundles_size`, `imported_packages` and `shader_map_hashes`, and
+> differed on exactly one field: `export_bundle_count`, on the ten affected
+> packages that the translation patch actually replaces. The build with the
+> JSON launched and played; the build with the computed layout hung at
+> startup — no crash, no error, no log, just "not responding".
+>
+> That also settles *why*. An earlier run of this experiment was confounded:
+> before patch 12 the engine read the original container's header while
+> loading our package bytes, so a build without the JSON could not avoid a
+> header-versus-data disagreement whatever the computed rule produced. The
+> obvious explanation — that the engine needs the two layers to agree rather
+> than needing the original layout — is now ruled out. The layers *did*
+> agree in the failing build. The bundle layout matters in its own right:
+> which exports share a bundle with which, not merely whether the counts are
+> consistent.
+>
+> The computed rule below gets 1134 of 1243 known multi-bundle packages
+> exactly right, and the remaining 109 are not a cosmetic rounding error —
+> a wrong bundle count on even one package the game loads is enough to hang
+> the whole container. If you don't have the original container to generate
+> a `RETOC_BUNDLE_LAYOUT` JSON from, treat the computed layout as a
+> best-effort fallback only, and **launch the actual game before shipping** —
+> retoc's own tooling cannot detect this (see the known-gaps note on
 > `warn_if_bundle_layout_uncertain` below, which catches only a small
 > fraction of the 109).
+>
+> Note that the JSON is not total coverage either: it is generated from the
+> original container and, on this title, misses two Engine-content packages
+> (`MasterSubmixDefault`, `MasterReverbSubmixDefault`) that are also
+> multi-bundle. They happen not to be replaced by the translation patch, so
+> they keep their original entries, but a different patch set could expose
+> them.
 
 The cooker splits a package's `export_load_order` (the Create/Serialize
 command sequence, which retoc already builds correctly) into bundles. The
@@ -361,10 +380,14 @@ out the cooker's rule; if anyone knows it, I would like to hear.
 17095, where the computed rule in fix 7 doesn't find the real bundle boundary
 (single-export native types, and Blueprint packages whose boundary isn't
 keyed on an index inversion — see fix 7). This is not cosmetic: confirmed by
-a controlled experiment to hang the game at startup with no crash and no
-log (see `TASK.md`, "Опыт состоялся"). `RETOC_BUNDLE_LAYOUT` covers all of
-them as a fallback when the original container's layout is available — for
-a shipping build, use it, don't rely on the computed rule alone.
+a controlled pair of builds, identical except for `export_bundle_count` on
+the ten of those 109 that the patch replaces, to hang the game at startup
+with no crash and no log (see `TASK.md`, "Журнал опыта: сборка №2").
+`RETOC_BUNDLE_LAYOUT` covers all 109 as a fallback when the original
+container's layout is available — for a shipping build, use it, don't rely
+on the computed rule alone. The error is always in one direction: the
+computed rule produces *fewer* bundles than the original, never more, so it
+is a lower bound rather than an approximation.
 
 **`imported_packages` is still wrong for 8 packages** out of 17095, all
 composition (a package the original lists as an untethered dependency with
