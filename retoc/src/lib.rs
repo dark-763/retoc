@@ -1,4 +1,5 @@
 pub mod asset_conversion;
+pub mod bundle_layout_pass;
 pub mod asset_registry;
 pub mod compact_binary;
 pub mod compression;
