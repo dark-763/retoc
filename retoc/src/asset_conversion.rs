@@ -9,7 +9,7 @@ use crate::name_map::FMappedName;
 use crate::script_objects::{FPackageObjectIndex, FPackageObjectIndexType, FScriptObjectEntry, ZenScriptObjects};
 use crate::ser::{ReadExt, Utf8String, WriteExt};
 use crate::verse_vm_types::VPackage;
-use crate::zen::{EExportCommandType, EExportFilterFlags, EObjectFlags, FCellExportMapEntry, FExportMapEntry, FExternalDependencyArc, FInternalDependencyArc, FPackageFileVersion, FPackageIndex, FZenPackageHeader, FZenPackageVersioningInfo, ZenScriptCellsStore};
+use crate::zen::{EExportCommandType, EExportFilterFlags, EObjectFlags, FCellExportMapEntry, FExportBundleEntry, FExportMapEntry, FExternalDependencyArc, FInternalDependencyArc, FPackageFileVersion, FPackageIndex, FZenPackageHeader, FZenPackageVersioningInfo, ZenScriptCellsStore};
 use crate::zen_asset_conversion::get_cell_export_hash;
 use crate::{EIoChunkType, FGuid, FIoChunkId, FPackageId, FileWriterTrait, UEPath};
 use crate::{debug, info, verbose, warning};
@@ -1052,10 +1052,34 @@ fn resolve_export_dependencies_internal_dependency_arcs(builder: &mut LegacyAsse
                     bundle_to_bundle_dependency_arc.from_export_bundle_index as usize
                 };
 
-                // Resolve the last element of the from export bundle
+                // Pick the node of the from export bundle that will represent this arc as a
+                // preload dependency. It has to be a PUBLIC export: the cooker only turns an
+                // import into a graph edge when it finds it among public exports, and anything
+                // else becomes an arc with no edge at all. Naming the bundle's last entry
+                // regardless of its flags - which is what this used to do - produced imports of
+                // non-public objects, and converting such an asset back to zen then dropped the
+                // dependency and moved the package to an earlier load pass. On the container this
+                // was measured against, 1153 of 40058 external dependencies came out that way.
+                //
+                // Among the public entries take the last one, preferring the command type of the
+                // bundle's own last entry so the common case keeps its previous phase. The arc
+                // itself is bundle-to-bundle, so any node of this bundle reproduces it.
                 let from_export_bundle = resolved_import_package.export_bundle_headers[from_bundle_index];
-                let from_export_bundle_last_element_index = (from_export_bundle.first_entry_index + from_export_bundle.entry_count - 1) as usize;
-                let from_export_bundle_entry = resolved_import_package.export_bundle_entries[from_export_bundle_last_element_index];
+                let first_entry = from_export_bundle.first_entry_index as usize;
+                let last_entry = first_entry + from_export_bundle.entry_count as usize - 1;
+                let bundle_entries = &resolved_import_package.export_bundle_entries[first_entry..=last_entry];
+
+                let is_public = |entry: &FExportBundleEntry| -> bool {
+                    (resolved_import_package.export_map[entry.local_export_index as usize].object_flags & (EObjectFlags::Public as u32)) != 0
+                };
+                let preferred_command = bundle_entries[bundle_entries.len() - 1].command_type;
+                let from_export_bundle_entry = bundle_entries
+                    .iter()
+                    .rev()
+                    .find(|e| is_public(e) && e.command_type == preferred_command)
+                    .or_else(|| bundle_entries.iter().rev().find(|e| is_public(e)))
+                    .copied()
+                    .unwrap_or(bundle_entries[bundle_entries.len() - 1]);
 
                 // Create fully resolved zen import from that export
                 let resolved_from_export_entry = resolved_import_package.export_map[from_export_bundle_entry.local_export_index as usize].clone();
