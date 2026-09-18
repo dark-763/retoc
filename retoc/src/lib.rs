@@ -729,7 +729,8 @@ impl Display for FPackageId {
     }
 }
 impl FPackageId {
-    fn from_name(name: &str) -> Self {
+    /// Package id of a package name such as `/Game/Foo/Bar`.
+    pub fn from_name(name: &str) -> Self {
         Self(lower_utf16_cityhash(name))
     }
 }

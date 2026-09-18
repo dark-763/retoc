@@ -1,4 +1,5 @@
 use crate::container_header::{EIoContainerHeaderVersion, StoreEntry};
+use crate::bundle_layout_pass::ContainerBundleLayout;
 use crate::iostore_writer::IoStoreWriter;
 use crate::legacy_asset::{EPackageFlags, FLegacyPackageFileSummary, FLegacyPackageHeader, FSerializedAssetBundle, convert_localized_package_name_to_source, get_package_object_full_name};
 use crate::logging::Log;
@@ -496,6 +497,21 @@ struct ZenDependencyGraphNode {
 
 static BUNDLE_LAYOUT_OVERRIDE: std::sync::OnceLock<HashMap<String, Vec<(u32, u32)>>> = std::sync::OnceLock::new();
 
+/// Layout and load order computed once for the whole container before any package is
+/// converted (see `bundle_layout_pass`). Held here rather than threaded through every
+/// signature because the per-package conversion already takes its layout from a process
+/// -wide source - this simply replaces reading a JSON file with reading a computed pass.
+static CONTAINER_BUNDLE_LAYOUT: std::sync::OnceLock<ContainerBundleLayout> = std::sync::OnceLock::new();
+
+/// Publish the result of the pre-pass. Must be called before converting any asset.
+pub fn set_container_bundle_layout(layout: ContainerBundleLayout) {
+    let _ = CONTAINER_BUNDLE_LAYOUT.set(layout);
+}
+
+fn container_bundle_layout() -> Option<&'static ContainerBundleLayout> {
+    CONTAINER_BUNDLE_LAYOUT.get()
+}
+
 /// Необязательное переопределение разбивки на бандлы, снятое с оригинального
 /// контейнера игры. Используется только как проверочный/резервный путь поверх
 /// `compute_bundle_layout` - когда переменная окружения не задана, retoc
@@ -715,7 +731,7 @@ fn warn_if_bundle_layout_uncertain(builder: &ZenPackageBuilder, export_load_orde
     }
 }
 
-fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_load_order: &[ZenExportGraphNode], export_dependencies: &HashMap<ZenDependencyGraphNode, Vec<ZenDependencyGraphNode>>) {
+fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_load_order: &[ZenExportGraphNode], export_dependencies: &HashMap<ZenDependencyGraphNode, Vec<ZenDependencyGraphNode>>) -> anyhow::Result<()> {
     let mut current_export_bundle_header_index: i64 = -1;
     let mut current_export_offset: u64 = 0;
     let mut export_to_bundle_map: HashMap<ZenDependencyGraphNode, usize> = HashMap::new();
@@ -789,9 +805,30 @@ fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_l
     // содержит запись для этого пакета) требует большего числа бандлов,
     // применяем её здесь.
     if builder.container_header_version <= EIoContainerHeaderVersion::Initial {
+        // Order of preference: RETOC_BUNDLE_LAYOUT as a manual override, then the
+        // container-wide pass, then the standalone heuristic. The pass knows every
+        // package of the container, so a package missing from it means the pass never
+        // saw it - that is an error at the caller, not something to paper over with a
+        // plausible guess: a wrong layout has been observed to hang the game silently.
         let json_layout = json_bundle_layout_override(&builder.package_name).cloned();
+        let pass_layout = match container_bundle_layout() {
+            Some(pass) if json_layout.is_none() => {
+                let computed = pass.layout_of(builder.package_id).ok_or_else(|| {
+                    anyhow!(
+                        "Package {} ({}) was not seen by the bundle layout pass, so its export bundle layout is unknown. Run the conversion over the whole input directory, or supply RETOC_BUNDLE_LAYOUT covering this package.",
+                        builder.package_name,
+                        builder.package_id
+                    )
+                })?;
+                Some(computed.clone())
+            }
+            _ => None,
+        };
         let export_map = builder.zen_package.export_map.clone();
-        let layout = json_layout.clone().or_else(|| compute_bundle_layout(export_load_order, &export_map));
+        let layout = json_layout
+            .clone()
+            .or(pass_layout)
+            .or_else(|| compute_bundle_layout(export_load_order, &export_map));
         if let Some(layout) = layout {
             if json_layout.is_none() {
                 warn_if_bundle_layout_uncertain(builder, export_load_order, &export_map, &layout);
@@ -1030,6 +1067,7 @@ fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_l
         builder.zen_package.imported_package_names = order.iter().map(|&i| old_imported_package_names[i].clone()).collect();
         builder.zen_package.external_package_dependencies = order.into_iter().map(|i| old_external_package_dependencies[i].clone()).collect();
     }
+    Ok(())
 }
 
 fn build_zen_dependency_bundle_new(builder: &mut ZenPackageBuilder, export_load_order: &[ZenExportGraphNode], export_dependencies: &HashMap<ZenDependencyGraphNode, Vec<ZenDependencyGraphNode>>) {
@@ -1406,7 +1444,7 @@ fn build_zen_preload_dependencies(builder: &mut ZenPackageBuilder) -> anyhow::Re
     if builder.container_header_version >= EIoContainerHeaderVersion::NoExportInfo {
         build_zen_dependency_bundle_new(builder, &sorted_node_list, &export_dependencies);
     } else {
-        build_zen_dependency_bundles_legacy(builder, &sorted_node_list, &export_dependencies);
+        build_zen_dependency_bundles_legacy(builder, &sorted_node_list, &export_dependencies)?;
     }
     Ok(())
 }
@@ -1494,6 +1532,14 @@ fn build_converted_zen_asset(builder: &ZenPackageBuilder, legacy_asset_bundle: F
     // Append shader map hashes to the store entry from the package name to shader maps lookup
     if let Some(referenced_shader_maps) = package_name_to_referenced_shader_maps.get(&package_name) {
         result_store_entry.shader_map_hashes.append(&mut referenced_shader_maps.clone());
+    }
+
+    // load_order is the global number of this package's first export bundle, which only
+    // the container-wide pass can know. Without the pass it stays 0, as it always was.
+    if let Some(pass) = container_bundle_layout()
+        && let Some(load_order) = pass.load_order_of(builder.package_id)
+    {
+        result_store_entry.load_order = load_order;
     }
 
     Ok(ConvertedZenAssetBundle {

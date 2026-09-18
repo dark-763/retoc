@@ -814,6 +814,9 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
 
     let log = Log::new_stdout(args.verbose, args.debug);
     let mut asset_paths = vec![];
+    // Every convertible asset, ignoring --filter: the bundle layout pass must see the
+    // whole container or its global bundle numbering is meaningless.
+    let mut all_asset_paths = vec![];
     let mut shader_lib_paths = vec![];
     let mut script_objects: Option<Arc<ZenScriptObjects>> = None;
 
@@ -828,6 +831,12 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
         let ue_path = UEPath::new(&path);
         let ext = ue_path.extension();
         let is_asset = [Some("uasset"), Some("umap")].contains(&ext);
+        if is_asset {
+            let uexp = ue_path.with_extension("uexp");
+            if files_set.contains(&uexp) {
+                all_asset_paths.push(path);
+            }
+        }
         if is_asset && check_path(path) {
             let uexp = ue_path.with_extension("uexp");
             if files_set.contains(&uexp) {
@@ -867,6 +876,33 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
 
     // Construct Verse Cell Store and populate it with intrinsics, as well as command line overrides
     let script_cell_store = build_verse_cell_store(&args.script_cell);
+
+    // The export bundle layout and the package load order are decided for the container
+    // as a whole, so they have to be computed before any package is converted - and over
+    // EVERY package of the input, not just the filtered ones, or the global bundle
+    // numbering would be wrong. `--filter` narrows what gets written, never what the pass
+    // sees.
+    if container_header_version <= EIoContainerHeaderVersion::Initial {
+        let mut pass_input: Vec<retoc::bundle_layout_pass::PassInput> = Vec::with_capacity(all_asset_paths.len());
+        info!(&log, "Computing export bundle layout over {} packages", all_asset_paths.len());
+        for path in &all_asset_paths {
+            let asset_buffer = input.read(path)?;
+            let header = retoc::legacy_asset::FLegacyPackageHeader::deserialize(&mut Cursor::new(asset_buffer), Some(args.version.package_file_version()))
+                .with_context(|| format!("Failed to read the legacy package header of {path} for the bundle layout pass"))?;
+            let stripped = mount_point.join(path);
+            let stripped = stripped.strip_prefix("../../../").unwrap();
+            let package_name = retoc::pak_path_to_game_path(stripped)
+                .with_context(|| format!("Failed to get Package Path from {stripped}"))?;
+            let package_name = package_name.rsplit_once('.').unwrap().0.to_string();
+            pass_input.push(retoc::bundle_layout_pass::PassInput {
+                package_id: retoc::FPackageId::from_name(&package_name),
+                package_name,
+                header,
+            });
+        }
+        let layout = retoc::bundle_layout_pass::compute_container_bundle_layout(pass_input, &log)?;
+        zen_asset_conversion::set_container_bundle_layout(layout);
+    }
 
     let progress = Some(indicatif::ProgressBar::new(asset_paths.len() as u64).with_style(progress_style()));
     log.set_progress(progress.as_ref());
