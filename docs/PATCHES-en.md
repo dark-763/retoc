@@ -95,21 +95,25 @@ The field was left unfilled. It is `header_size` plus the sum of
 
 `zen_asset_conversion.rs`, `compute_bundle_layout`
 
-> **`RETOC_BUNDLE_LAYOUT` is required for shipping builds, not optional.**
-> Confirmed by a controlled experiment (see `TASK.md`, "Опыт состоялся"):
-> a build with the computed layout and no JSON hung the game at startup —
-> no crash, no error, no log, just "not responding" — while an otherwise
-> identical build (same arc dedup, same `imported_packages` sort) with
-> `RETOC_BUNDLE_LAYOUT` supplied launched and ran correctly. The computed
-> rule below gets 1134 of 1243 known multi-bundle packages exactly right,
-> but the other 109 aren't a cosmetic rounding error — a wrong bundle
-> count on even one of them is enough to hang the whole container. If you
-> don't have the original container to generate a `RETOC_BUNDLE_LAYOUT`
-> JSON from, treat the computed layout as a best-effort fallback only, and
-> **launch the actual game before shipping** — there's no other way to
-> catch this failure mode; retoc's own tooling can't detect it (see the
-> known-gaps note on `warn_if_bundle_layout_uncertain` below, which catches
-> only a small fraction of the 109).
+> **Keep supplying `RETOC_BUNDLE_LAYOUT` for shipping builds — but the
+> evidence behind that advice is confounded and is being re-examined.**
+> It rests on one experiment (see `TASK.md`): a build with the computed
+> layout and no JSON hung the game at startup — no crash, no error, no
+> log, just "not responding" — while an otherwise identical build with the
+> JSON launched and ran. Both of those builds, however, predate the
+> `pack-raw` container-header fix (patch 12), so in both of them the engine
+> read the *original* container's header while loading *our* package bytes.
+> The header announced the original bundle count for packages whose data we
+> had rebuilt with a different one, and no build without the JSON could have
+> avoided that disagreement regardless of how good the computed rule was.
+> The JSON may therefore have been curing a mismatch between two layers
+> rather than a wrong layout. With patch 12 in place both layers come from
+> us and agree by construction, so the computed rule may well stand on its
+> own; that is now a decidable experiment and has not been run yet. Either
+> way, **launch the actual game before shipping** — retoc's own tooling
+> cannot detect a wrong bundle count (see the known-gaps note on
+> `warn_if_bundle_layout_uncertain` below, which catches only a small
+> fraction of the 109).
 
 The cooker splits a package's `export_load_order` (the Create/Serialize
 command sequence, which retoc already builds correctly) into bundles. The
