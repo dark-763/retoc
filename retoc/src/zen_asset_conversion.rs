@@ -523,9 +523,28 @@ fn json_bundle_layout_override(package_name: &str) -> Option<&'static Vec<(u32, 
     if map.is_empty() {
         return None;
     }
-    // Ключи в файле вида "SRTE/Content/A/.../Name", имя пакета - "/Game/A/.../Name"
-    let key = package_name.replacen("/Game", "SRTE/Content", 1).to_lowercase();
-    map.get(&key)
+    map.get(&bundle_layout_key(package_name))
+}
+
+/// Ключи в JSON - пути внутри контейнера (`SRTE/Content/A/.../Name`,
+/// `Engine/Content/EngineSounds/.../Name`), а на вход приходит имя пакета
+/// (`/Game/A/.../Name`, `/Engine/EngineSounds/.../Name`). Отображение идёт по
+/// первому сегменту имени: это точка монтирования, и на диске ей соответствует
+/// каталог `<точка>/Content`, где `/Game` - это каталог проекта.
+///
+/// Раньше здесь была замена только `/Game` -> `SRTE/Content`, из-за чего ЛЮБАЯ
+/// запись не из game-контента молча не находилась: имя `/Engine/...` давало ключ
+/// `/engine/...`, а в JSON лежит `engine/content/...`. На проверяемом контейнере
+/// так терялись 2 записи из 1243 (`MasterSubmixDefault`,
+/// `MasterReverbSubmixDefault`), и расчётный остаток с полным JSON был 2, а не 0.
+fn bundle_layout_key(package_name: &str) -> String {
+    // Имя каталога проекта на диске; в именах пакетов ему соответствует /Game.
+    const PROJECT_CONTENT_ROOT: &str = "SRTE";
+
+    let trimmed = package_name.trim_start_matches('/');
+    let (mount, rest) = trimmed.split_once('/').unwrap_or((trimmed, ""));
+    let root = if mount.eq_ignore_ascii_case("Game") { PROJECT_CONTENT_ROOT } else { mount };
+    format!("{root}/Content/{rest}").to_lowercase()
 }
 
 /// Вычисляет разбивку пакета на бандлы экспортов из уже построенного порядка
@@ -1753,6 +1772,21 @@ mod test {
     use crate::version::EngineVersion;
     use crate::{EIoStoreTocVersion, PackageTestMetadata};
     use fs_err as fs;
+
+    /// `RETOC_BUNDLE_LAYOUT` keys are container paths while lookups come in as package
+    /// names, and the mapping has to work for every mount point, not just game content.
+    #[test]
+    fn bundle_layout_key_maps_every_mount_point() {
+        assert_eq!(bundle_layout_key("/Game/A/Menu/WBP_Settings"), "srte/content/a/menu/wbp_settings");
+        assert_eq!(
+            bundle_layout_key("/Engine/EngineSounds/Submixes/MasterSubmixDefault"),
+            "engine/content/enginesounds/submixes/mastersubmixdefault"
+        );
+        assert_eq!(
+            bundle_layout_key("/Niagara/Enums/ENiagaraBooleanLogicOps"),
+            "niagara/content/enums/eniagarabooleanlogicops"
+        );
+    }
 
     /// The two class paths `is_clean_boundary` keys on must hash to the script objects
     /// the cooker actually recorded, or the narrowing condition silently never fires
