@@ -553,11 +553,60 @@ fn json_bundle_layout_override(package_name: &str) -> Option<&'static Vec<(u32, 
 /// ловит - см. TASK.md, пункт про сверку на всём проекте. Условие Create-only
 /// не даёт ни одного ложного срабатывания ни на одном из 17095 пакетов проекта.
 ///
-/// Правило подтверждено точным совпадением на 1134 из 1243 проверенных
-/// пакетов с несколькими бандлами (см. TASK.md) и НУЛЁМ ложных срабатываний
-/// на всех 17095 пакетах проекта (включая однобандульные).
-fn compute_bundle_layout(export_load_order: &[ZenExportGraphNode]) -> Option<Vec<(u32, u32)>> {
-    compute_bundle_layout_cuts(export_load_order, false)
+/// Широкий вариант отвергнут как ОСНОВНОЕ правило, но его срабатывания не
+/// случайны: из 113 разрезов, которые Create-only правило пропускает, 84 имеют
+/// ровно эту форму. Поэтому поверх него добавлено СУЖАЮЩЕЕ условие по классам
+/// экспортов вокруг разреза (`is_clean_boundary`) - см. его комментарий и
+/// раздел "Описание 109 пропущенных разрезов" в TASK.md.
+///
+/// Правило подтверждено поэлементной сверкой позиций разрезов с оригинальным
+/// контейнером на ВСЕХ 17095 пакетах (одна игра, UE 4.26.2): точное совпадение
+/// раскладки у 17038 пакетов, 57 пропущенных разрезов и НИ ОДНОГО лишнего.
+/// Без сужающего условия было 16986 точных и 113 пропущенных, тоже без лишних.
+/// Ни в одном пакете число бандлов не совпало при неверном их составе.
+fn compute_bundle_layout(export_load_order: &[ZenExportGraphNode], export_map: &[FExportMapEntry]) -> Option<Vec<(u32, u32)>> {
+    compute_bundle_layout_cuts(export_load_order, export_map, false)
+}
+
+/// Классы, соседство с которыми на кандидате в разрез НИ РАЗУ не встретилось в
+/// пакете, у которого кукер оставил один бандл.
+///
+/// Получено замером по оригинальному контейнеру: широкое правило (разрез после
+/// Serialize, если у следующей команды меньший индекс) срабатывает 289 раз в 136
+/// пакетах, которые на самом деле однобандловые. Разбивка этих срабатываний и
+/// настоящих границ по классу экспорта дала полное разделение для трёх случаев:
+///
+/// | класс                       | настоящих границ | ложных |
+/// |-----------------------------|------------------|--------|
+/// | Function ПОСЛЕ разреза      |               55 |      0 |
+/// | WidgetTree ДО разреза       |               16 |      0 |
+/// | Function ДО разреза         |               11 |      0 |
+/// | класс-экспорт ДО разреза    |               12 |      0 |
+///
+/// Для сравнения, неразделимые случаи: BlueprintGeneratedClass после разреза -
+/// 27 настоящих против 132 ложных, SimpleConstructionScript до разреза - 17
+/// против 125. Их сюда включать нельзя.
+///
+/// Смысл: кукер закрывает бандл после инфраструктуры Blueprint'а (дерево
+/// виджетов, функции) и перед функциями класса; компоненты обычного актора
+/// (StaticMeshComponent, ChildActorComponent, SimpleConstructionScript), дающие
+/// всю массу ложных срабатываний, в этот набор не попадают.
+///
+/// "Класс-экспорт" - это когда class_index указывает на экспорт этого же пакета,
+/// то есть объект по умолчанию класса, сгенерированного здесь же.
+fn is_clean_boundary(before: &FExportMapEntry, after: &FExportMapEntry) -> bool {
+    static CLASSES: std::sync::OnceLock<(FPackageObjectIndex, FPackageObjectIndex)> = std::sync::OnceLock::new();
+    let (function, widget_tree) = CLASSES.get_or_init(|| {
+        (
+            FPackageObjectIndex::create_script_import("/Script/CoreUObject.Function"),
+            FPackageObjectIndex::create_script_import("/Script/UMG.WidgetTree"),
+        )
+    });
+
+    after.class_index == *function
+        || before.class_index == *function
+        || before.class_index == *widget_tree
+        || before.class_index.kind() == FPackageObjectIndexType::Export
 }
 
 /// Shared cut-finding logic behind `compute_bundle_layout`, parameterized on whether
@@ -565,7 +614,7 @@ fn compute_bundle_layout(export_load_order: &[ZenExportGraphNode]) -> Option<Vec
 /// rejected variant described above - kept only as a diagnostic signal, see
 /// `warn_if_bundle_layout_uncertain`) or only after `Serialize` followed by a smaller
 /// `Create` (`!wide`, the actual production rule).
-fn compute_bundle_layout_cuts(export_load_order: &[ZenExportGraphNode], wide: bool) -> Option<Vec<(u32, u32)>> {
+fn compute_bundle_layout_cuts(export_load_order: &[ZenExportGraphNode], export_map: &[FExportMapEntry], wide: bool) -> Option<Vec<(u32, u32)>> {
     let flat: Vec<(u32, EExportCommandType)> = export_load_order
         .iter()
         .filter(|n| n.node.package_index.is_export())
@@ -580,7 +629,10 @@ fn compute_bundle_layout_cuts(export_load_order: &[ZenExportGraphNode], wide: bo
             continue;
         }
         let (next_idx, next_cmd) = flat[i + 1];
-        let is_cut = next_idx < idx && (wide || next_cmd == EExportCommandType::Create);
+        let is_cut = next_idx < idx
+            && (wide
+                || next_cmd == EExportCommandType::Create
+                || is_clean_boundary(&export_map[idx as usize], &export_map[next_idx as usize]));
         if is_cut {
             layout.push((start as u32, (i + 1 - start) as u32));
             start = i + 1;
@@ -620,8 +672,8 @@ fn compute_bundle_layout_cuts(export_load_order: &[ZenExportGraphNode], wide: bo
 /// container exports that close without an index inversion at all) have no `next_idx
 /// < idx` step for either rule to catch. Absence of this warning is not a guarantee of
 /// a correct layout; presence of it is a reliable hint to check this specific package.
-fn warn_if_bundle_layout_uncertain(builder: &ZenPackageBuilder, export_load_order: &[ZenExportGraphNode], narrow_layout: &[(u32, u32)]) {
-    if let Some(wide_layout) = compute_bundle_layout_cuts(export_load_order, true)
+fn warn_if_bundle_layout_uncertain(builder: &ZenPackageBuilder, export_load_order: &[ZenExportGraphNode], export_map: &[FExportMapEntry], narrow_layout: &[(u32, u32)]) {
+    if let Some(wide_layout) = compute_bundle_layout_cuts(export_load_order, export_map, true)
         && wide_layout.len() != narrow_layout.len()
     {
         warning!(
@@ -709,10 +761,11 @@ fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_l
     // применяем её здесь.
     if builder.container_header_version <= EIoContainerHeaderVersion::Initial {
         let json_layout = json_bundle_layout_override(&builder.package_name).cloned();
-        let layout = json_layout.clone().or_else(|| compute_bundle_layout(export_load_order));
+        let export_map = builder.zen_package.export_map.clone();
+        let layout = json_layout.clone().or_else(|| compute_bundle_layout(export_load_order, &export_map));
         if let Some(layout) = layout {
             if json_layout.is_none() {
-                warn_if_bundle_layout_uncertain(builder, export_load_order, &layout);
+                warn_if_bundle_layout_uncertain(builder, export_load_order, &export_map, &layout);
             }
             let total = builder.zen_package.export_bundle_entries.len() as u32;
             let sum: u32 = layout.iter().map(|(_, c)| *c).sum();
@@ -1700,6 +1753,23 @@ mod test {
     use crate::version::EngineVersion;
     use crate::{EIoStoreTocVersion, PackageTestMetadata};
     use fs_err as fs;
+
+    /// The two class paths `is_clean_boundary` keys on must hash to the script objects
+    /// the cooker actually recorded, or the narrowing condition silently never fires
+    /// and the bundle layout quietly regresses to the Create-only rule. These indices
+    /// were read out of the shipped `global.utoc` of the UE 4.26.2 title the rule was
+    /// measured on, via `retoc print-script-objects`.
+    #[test]
+    fn clean_boundary_class_paths_match_script_objects() {
+        assert_eq!(
+            FPackageObjectIndex::create_script_import("/Script/CoreUObject.Function").value(),
+            Some(6291290835964162768)
+        );
+        assert_eq!(
+            FPackageObjectIndex::create_script_import("/Script/UMG.WidgetTree").value(),
+            Some(4813877483002703682)
+        );
+    }
 
     // Builds zen asset and returns the resulting package ID, chunk data buffer, and it's store entry. Zen package conversion does not modify bulk data in any way.
     pub fn build_serialize_zen_asset(legacy_asset: &FSerializedAssetBundle, container_header_version: EIoContainerHeaderVersion, package_version_fallback: Option<FPackageFileVersion>, source_package_name: Option<String>) -> anyhow::Result<(FPackageId, StoreEntry, Vec<u8>)> {
