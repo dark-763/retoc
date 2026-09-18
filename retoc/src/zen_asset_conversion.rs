@@ -835,6 +835,30 @@ fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_l
                         export_to_bundle_map.insert(node, bundle_index);
                     }
                 }
+
+                // То же самое, но для карты, по которой ДРУГИЕ пакеты разрешают сторону
+                // `from` своих внешних арок (`fixup_legacy_external_arcs`). Она тоже
+                // заполнялась выше, когда бандл был ещё один на пакет, и потому у каждой
+                // записи стоит 0. Без этого обновления любая арка, ведущая в этот пакет,
+                // получает from = 0 независимо от того, в каком бандле реально лежит
+                // экспорт: на проверяемом контейнере так схлопывалось 1787 арок в 1189
+                // пакетах, и после дедупликации они либо сливались с уже имеющейся
+                // (0, to), либо появлялись как новая.
+                if builder.fixup_legacy_external_arcs {
+                    let mut real_bundle_of: HashMap<(FPackageObjectIndex, EExportCommandType), i32> = HashMap::new();
+                    for (bundle_index, (first, count)) in layout.iter().enumerate() {
+                        for i in *first..(*first + *count) {
+                            let entry = builder.zen_package.export_bundle_entries[i as usize];
+                            let global_index = builder.zen_package.export_map[entry.local_export_index as usize].legacy_global_import_index();
+                            real_bundle_of.insert((global_index, entry.command_type), bundle_index as i32);
+                        }
+                    }
+                    for mapping in builder.legacy_export_bundle_mapping.iter_mut() {
+                        if let Some(real_index) = real_bundle_of.get(&(mapping.export_index, mapping.export_command_type)) {
+                            mapping.export_bundle_index = *real_index;
+                        }
+                    }
+                }
             }
         }
     }
