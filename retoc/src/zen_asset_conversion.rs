@@ -537,6 +537,16 @@ fn json_bundle_layout_override(package_name: &str) -> Option<&'static Vec<(u32, 
 /// `/engine/...`, а в JSON лежит `engine/content/...`. На проверяемом контейнере
 /// так терялись 2 записи из 1243 (`MasterSubmixDefault`,
 /// `MasterReverbSubmixDefault`), и расчётный остаток с полным JSON был 2, а не 0.
+///
+/// ОГРАНИЧЕНИЕ: поддерживаются только точки монтирования, лежащие прямо в корне
+/// контейнера - `/Game` и `/Engine`. Пакеты плагинов не поддерживаются: их точка
+/// монтирования не выводится из имени пакета. `/Niagara/Foo/X` лежит в контейнере
+/// по пути `Engine/Plugins/FX/Niagara/Content/Foo/X`, и промежуточные сегменты
+/// (`Plugins/FX`) в имени никак не представлены - чтобы их восстановить, нужна
+/// таблица путей самого контейнера, которой здесь нет. Для записи такого пакета в
+/// JSON ключ просто не совпадёт, и переопределение молча не применится. На
+/// проверяемом контейнере это безвредно: в `bundle_layout.json` 1241 запись
+/// `SRTE/Content` и 2 `Engine/Content`, плагинных нет.
 fn bundle_layout_key(package_name: &str) -> String {
     // Имя каталога проекта на диске; в именах пакетов ему соответствует /Game.
     const PROJECT_CONTENT_ROOT: &str = "SRTE";
@@ -1774,17 +1784,14 @@ mod test {
     use fs_err as fs;
 
     /// `RETOC_BUNDLE_LAYOUT` keys are container paths while lookups come in as package
-    /// names, and the mapping has to work for every mount point, not just game content.
+    /// names. Only the two mount points that sit directly at the container root are
+    /// covered; see `bundle_layout_key` for why plugins are not.
     #[test]
-    fn bundle_layout_key_maps_every_mount_point() {
+    fn bundle_layout_key_maps_root_mount_points() {
         assert_eq!(bundle_layout_key("/Game/A/Menu/WBP_Settings"), "srte/content/a/menu/wbp_settings");
         assert_eq!(
             bundle_layout_key("/Engine/EngineSounds/Submixes/MasterSubmixDefault"),
             "engine/content/enginesounds/submixes/mastersubmixdefault"
-        );
-        assert_eq!(
-            bundle_layout_key("/Niagara/Enums/ENiagaraBooleanLogicOps"),
-            "niagara/content/enums/eniagarabooleanlogicops"
         );
     }
 
