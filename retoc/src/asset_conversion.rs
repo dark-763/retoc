@@ -1073,13 +1073,31 @@ fn resolve_export_dependencies_internal_dependency_arcs(builder: &mut LegacyAsse
                     (resolved_import_package.export_map[entry.local_export_index as usize].object_flags & (EObjectFlags::Public as u32)) != 0
                 };
                 let preferred_command = bundle_entries[bundle_entries.len() - 1].command_type;
-                let from_export_bundle_entry = bundle_entries
+                let from_export_bundle_entry = match bundle_entries
                     .iter()
                     .rev()
                     .find(|e| is_public(e) && e.command_type == preferred_command)
                     .or_else(|| bundle_entries.iter().rev().find(|e| is_public(e)))
-                    .copied()
-                    .unwrap_or(bundle_entries[bundle_entries.len() - 1]);
+                {
+                    Some(entry) => *entry,
+                    None => {
+                        // A bundle with no public export at all cannot be what the cooker
+                        // depended on, so this arc cannot be represented faithfully. Fall back
+                        // to the old behaviour rather than dropping the dependency, but say so:
+                        // a silent fallback here would reintroduce exactly the class of bug
+                        // this change fixes. Not observed on the container this was measured
+                        // against.
+                        warning!(
+                            builder.package_context.log,
+                            "Package {} ({}): export bundle {} of imported package {} has no public exports, representing its dependency arc by a non-public export. The resulting asset may convert back to zen with a different bundle layout.",
+                            builder.package_id,
+                            builder.zen_package.package_name(),
+                            from_bundle_index,
+                            resolved_import_package.package_name()
+                        );
+                        bundle_entries[bundle_entries.len() - 1]
+                    }
+                };
 
                 // Create fully resolved zen import from that export
                 let resolved_from_export_entry = resolved_import_package.export_map[from_export_bundle_entry.local_export_index as usize].clone();
