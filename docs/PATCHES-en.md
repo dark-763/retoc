@@ -1,4 +1,4 @@
-# Ten fixes for repacking UE 4.26 IoStore containers
+# Eleven fixes for repacking UE 4.26 IoStore containers
 
 This fork of [retoc](https://github.com/trumank/retoc) makes it possible not
 just to read an IoStore container but to rebuild one the engine will accept.
@@ -279,18 +279,57 @@ was checked not to move anything that matters on disk: `export_count`,
 `export_bundle_count` and graph-region byte-for-byte match are identical
 before and after.
 
-**Separate, upstream bug found while investigating a different issue**: the
-order this fix computes doesn't survive `pack-raw`/`unpack-raw` for a small
-number of packages (~85 of 17095) regardless of what's written — reproduced
-with an empty `imported_packages` list still coming back as the original
-container's actual value after a round trip, with a from-scratch,
-byte-level manual re-implementation of the `FIoContainerHeader`/
-`StoreEntries` format confirming the on-disk bytes are correct and empty
-while retoc's own reader reports the original's value anyway. Root cause
-not identified despite that; not in code this fork touches
-(`container_header.rs` has no commits from this fork) — see `TASK.md`,
-"Фантом: доведено до конца, механизм НЕ найден" for the full repro, worth
-raising upstream directly.
+A bug found while investigating this fix — order not surviving
+`pack-raw`/`unpack-raw` for a small number of packages, regardless of what
+was written — turned out to be a separate, unrelated defect in this fork's
+own `pack-raw`, not in anything this fix touches. See fix 11.
+
+## 11. `pack-raw` duplicated the container header chunk
+
+`retoc_cli/src/main.rs`, `action_pack_raw`
+
+A raw chunks directory produced by `unpack-raw` includes a copy of the
+container's own header chunk — it has no path, so nothing in
+`chunk_paths` points at it, but it's still an ordinary file in `chunks/`.
+`action_pack_raw` copied it straight through via `write_chunk_raw`, the
+same as any chunk type it doesn't specifically recognize. `IoStoreWriter::
+finalize()` then built and wrote its *own*, correct header — from
+`manifest.package_store_entries` — under the identical chunk type, at the
+very end. Both ended up in the same output container.
+
+`IoStoreContainer::open()` finds "the" header with
+`chunks().find(|info| info.id().get_chunk_type() == ContainerHeader)` —
+first match wins, with no check against the id it actually expects. The
+stale copy, written by the main loop, always sorted earlier in the TOC
+than the fresh one from `finalize()`, so `.find()` picked the stale one
+every time.
+
+This isn't an edge case — it's present on essentially every real use of
+`pack-raw`, since "`unpack-raw` a container, edit some chunks and the
+manifest, `pack-raw` it back" is exactly the workflow the tool exists for.
+It surfaced as the "phantom" reordering bug under investigation for fix
+10: for most packages, the freshly-computed `imported_packages` happened
+to already match what the stale header held, so nothing looked wrong;
+for the ~85 (of 17095) where they genuinely differed, the stale value won
+every time, no matter what the manifest said — confirmed with an
+explicitly empty `imported_packages` list for one package still coming
+back as the original container's actual (non-empty) value after a round
+trip, and with debug output in both `container_header.rs`'s read and
+write paths showing the same package at two different positions
+depending on which header got parsed — i.e., two distinct header chunks,
+not one being misread.
+
+Fix: skip any input chunk of type `ContainerHeader` in the copy loop —
+`finalize()` always builds and writes the real one afterwards, so an old
+copy is never needed. Verified on the full 17095-package project (the
+same `to-zen` → `unpack-raw` → `patch_smart.py` → `pack-raw` →
+`unpack-raw` pipeline used throughout this investigation): zero remaining
+`imported_packages` differences of any kind, zero differences in every
+other `StoreEntry` field, and the chunk count back to the expected 19779
+(was 19780 — the duplicate).
+
+This is entirely inside `retoc_cli`, not `container_header.rs` — no
+upstream PR needed for this one.
 
 ---
 
