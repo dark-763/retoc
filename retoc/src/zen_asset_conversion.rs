@@ -557,6 +557,15 @@ fn json_bundle_layout_override(package_name: &str) -> Option<&'static Vec<(u32, 
 /// пакетов с несколькими бандлами (см. TASK.md) и НУЛЁМ ложных срабатываний
 /// на всех 17095 пакетах проекта (включая однобандульные).
 fn compute_bundle_layout(export_load_order: &[ZenExportGraphNode]) -> Option<Vec<(u32, u32)>> {
+    compute_bundle_layout_cuts(export_load_order, false)
+}
+
+/// Shared cut-finding logic behind `compute_bundle_layout`, parameterized on whether
+/// a cut is allowed after *any* command with a smaller next index (`wide`, the
+/// rejected variant described above - kept only as a diagnostic signal, see
+/// `warn_if_bundle_layout_uncertain`) or only after `Serialize` followed by a smaller
+/// `Create` (`!wide`, the actual production rule).
+fn compute_bundle_layout_cuts(export_load_order: &[ZenExportGraphNode], wide: bool) -> Option<Vec<(u32, u32)>> {
     let flat: Vec<(u32, EExportCommandType)> = export_load_order
         .iter()
         .filter(|n| n.node.package_index.is_export())
@@ -571,7 +580,8 @@ fn compute_bundle_layout(export_load_order: &[ZenExportGraphNode]) -> Option<Vec
             continue;
         }
         let (next_idx, next_cmd) = flat[i + 1];
-        if next_cmd == EExportCommandType::Create && next_idx < idx {
+        let is_cut = next_idx < idx && (wide || next_cmd == EExportCommandType::Create);
+        if is_cut {
             layout.push((start as u32, (i + 1 - start) as u32));
             start = i + 1;
         }
@@ -579,6 +589,46 @@ fn compute_bundle_layout(export_load_order: &[ZenExportGraphNode]) -> Option<Vec
     layout.push((start as u32, (flat.len() - start) as u32));
 
     if layout.len() > 1 { Some(layout) } else { None }
+}
+
+/// Diagnostic-only cross-check, run whenever this package's bundle layout came from
+/// `compute_bundle_layout` rather than `RETOC_BUNDLE_LAYOUT` (a JSON entry means we
+/// have real ground truth already, nothing to warn about). It has no effect on the
+/// layout actually used - it only decides whether to print a warning.
+///
+/// The wide rule (cut after *any* command, not just `Serialize` -> smaller `Create`)
+/// was rejected as the production rule because it wrongly splits packages that have
+/// exactly one bundle in the original (see `compute_bundle_layout_cuts` doc comment
+/// and TASK.md). But that same over-eagerness makes it a useful uncertainty signal
+/// here: when it disagrees with the narrow rule on how many bundles a package needs,
+/// this package is in the same shape as the 109 (out of 1243) known cases where the
+/// narrow rule's Create-only condition misses the real boundary - there is no way to
+/// tell, from this package's own data alone, whether the narrow or the wide count (or
+/// neither) is actually correct; only the original container or RETOC_BUNDLE_LAYOUT
+/// can settle it. A wrong bundle count is not cosmetic: it has been confirmed (see
+/// TASK.md, "Опыт состоялся") to make the game hang on startup with no crash and no
+/// log, so this is worth surfacing even though it can't be resolved automatically.
+///
+/// This is a weak, partial signal, not a detector: measured on the full 17095-package
+/// project without RETOC_BUNDLE_LAYOUT, it flagged 12 packages, of which 7 were
+/// actually among the 109 known-wrong ones (the rest were cases where the narrow rule
+/// was already right and the wide rule would have been wrong). It misses the other
+/// 102 - both known 109-residual shapes (single-export native types, and Blueprint
+/// container exports that close without an index inversion at all) have no `next_idx
+/// < idx` step for either rule to catch. Absence of this warning is not a guarantee of
+/// a correct layout; presence of it is a reliable hint to check this specific package.
+fn warn_if_bundle_layout_uncertain(builder: &ZenPackageBuilder, export_load_order: &[ZenExportGraphNode], narrow_layout: &[(u32, u32)]) {
+    if let Some(wide_layout) = compute_bundle_layout_cuts(export_load_order, true)
+        && wide_layout.len() != narrow_layout.len()
+    {
+        warning!(
+            builder.log,
+            "Package {} has an uncertain computed bundle layout: {} bundle(s) by the production rule, {} by a wider heuristic that catches more real boundaries but also false-positives on single-bundle packages. A wrong bundle count here has been observed to hang the game at startup with no crash and no log - verify against the original container or supply RETOC_BUNDLE_LAYOUT for this package before shipping.",
+            &builder.package_name,
+            narrow_layout.len(),
+            wide_layout.len()
+        );
+    }
 }
 
 fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_load_order: &[ZenExportGraphNode], export_dependencies: &HashMap<ZenDependencyGraphNode, Vec<ZenDependencyGraphNode>>) {
@@ -655,8 +705,12 @@ fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_l
     // содержит запись для этого пакета) требует большего числа бандлов,
     // применяем её здесь.
     if builder.container_header_version <= EIoContainerHeaderVersion::Initial {
-        let layout = json_bundle_layout_override(&builder.package_name).cloned().or_else(|| compute_bundle_layout(export_load_order));
+        let json_layout = json_bundle_layout_override(&builder.package_name).cloned();
+        let layout = json_layout.clone().or_else(|| compute_bundle_layout(export_load_order));
         if let Some(layout) = layout {
+            if json_layout.is_none() {
+                warn_if_bundle_layout_uncertain(builder, export_load_order, &layout);
+            }
             let total = builder.zen_package.export_bundle_entries.len() as u32;
             let sum: u32 = layout.iter().map(|(_, c)| *c).sum();
             if sum == total {
