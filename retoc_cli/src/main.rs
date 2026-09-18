@@ -624,6 +624,26 @@ fn action_pack_raw(args: ActionPackRaw, _config: Arc<Config>) -> Result<()> {
         let entry = entry?;
         let chunk_id = FIoChunkIdRaw::from_str(entry.file_name().to_string_lossy().as_ref())?;
         let chunk_id_key: raw::ChunkId = chunk_id.into();
+
+        // A directory of raw chunks produced by `unpack-raw` includes a copy of the
+        // container's OWN header chunk (it has no path, so it never matches an entry
+        // below) - almost always the case in practice, since patching an existing
+        // container's raw dump in place is the main reason to run `pack-raw` at all.
+        // `finalize()` below always builds and writes a fresh header chunk from
+        // `manifest.package_store_entries`, under the same chunk type, at the very end.
+        // Copying this stale one through first left two header chunks in the same
+        // container; which one `IoStoreContainer::open()` finds later on read back
+        // depends only on iteration order over the TOC; write-through order made it
+        // pick the stale one every time in testing here. Confirmed by reproduction:
+        // an empty `imported_packages` in the manifest for a given package still came
+        // back as the original container's actual (non-empty) value after a
+        // pack-raw -> unpack-raw round trip, for as long as this stale copy was
+        // present in the input directory; removing it from the input fixed it. Skip
+        // it here so only the freshly-built header ever exists in the output.
+        if FIoChunkId::from_raw(chunk_id, writer.container_version()).get_chunk_type() == EIoChunkType::ContainerHeader {
+            continue;
+        }
+
         let path = manifest.chunk_paths.get(&chunk_id_key).map(UEPath::new);
         let data = fs::read(entry.path())?;
         if let Some(store_entry) = manifest.package_store_entries.get(&chunk_id_key) {
