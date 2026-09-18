@@ -1022,6 +1022,10 @@ fn resolve_export_dependencies_internal_dependency_arcs(builder: &mut LegacyAsse
     // If this is a legacy package (UE4.27 or below) where dependencies are between bundles from different packages, process them here
     // Note that this might result in resolution and loading of new packages, which is why this function can fail
     if builder.zen_package.container_header_version <= EIoContainerHeaderVersion::Initial {
+        // Every object this package imports, as global import indices. The representative
+        // chosen for an arc below has to be one of these - see the comment at the selection.
+        let receiver_imports: HashSet<FPackageObjectIndex> = builder.zen_package.import_map.iter().copied().collect();
+
         for external_package_dependency in builder.zen_package.external_package_dependencies.clone() {
             let imported_package_id = external_package_dependency.from_package_id;
             let import_package_result = builder.package_context.lookup(imported_package_id);
@@ -1061,9 +1065,21 @@ fn resolve_export_dependencies_internal_dependency_arcs(builder: &mut LegacyAsse
                 // dependency and moved the package to an earlier load pass. On the container this
                 // was measured against, 1153 of 40058 external dependencies came out that way.
                 //
-                // Among the public entries take the last one, preferring the command type of the
-                // bundle's own last entry so the common case keeps its previous phase. The arc
-                // itself is bundle-to-bundle, so any node of this bundle reproduces it.
+                // It also has to be an object this package ALREADY imports. The cooker built the
+                // arc from a preload dependency, and a dependency can only name something the
+                // import map already holds - so a representative outside that map is invented,
+                // and naming it makes the synthesis add an import the original never had. On the
+                // container this was measured against, every one of the 103077 arcs with a real
+                // source bundle has such a node, so this never falls through in practice.
+                //
+                // Determinism: among the entries satisfying both conditions take the LAST in
+                // bundle order, preferring the command type of the bundle's own last entry. Last
+                // rather than first because that is what the previous rule effectively picked for
+                // the common case, so layouts stay put; the phase preference keeps the same node
+                // when the old choice already qualified. The arc itself is bundle-to-bundle, so
+                // any node of this bundle reproduces it, and the phase must come from the node
+                // actually chosen - a phase carried over from a replaced entry can point into a
+                // different bundle.
                 let from_export_bundle = resolved_import_package.export_bundle_headers[from_bundle_index];
                 let first_entry = from_export_bundle.first_entry_index as usize;
                 let last_entry = first_entry + from_export_bundle.entry_count as usize - 1;
@@ -1072,11 +1088,33 @@ fn resolve_export_dependencies_internal_dependency_arcs(builder: &mut LegacyAsse
                 let is_public = |entry: &FExportBundleEntry| -> bool {
                     (resolved_import_package.export_map[entry.local_export_index as usize].object_flags & (EObjectFlags::Public as u32)) != 0
                 };
+                let is_imported_by_receiver = |entry: &FExportBundleEntry| -> bool {
+                    receiver_imports.contains(&resolved_import_package.export_map[entry.local_export_index as usize].legacy_global_import_index())
+                };
                 let preferred_command = bundle_entries[bundle_entries.len() - 1].command_type;
-                let from_export_bundle_entry = match bundle_entries
+
+                let already_imported = bundle_entries
                     .iter()
                     .rev()
-                    .find(|e| is_public(e) && e.command_type == preferred_command)
+                    .find(|e| is_public(e) && is_imported_by_receiver(e) && e.command_type == preferred_command)
+                    .or_else(|| bundle_entries.iter().rev().find(|e| is_public(e) && is_imported_by_receiver(e)));
+
+                if already_imported.is_none() {
+                    // Fall back to the previous rule - the last public entry - rather than
+                    // dropping the dependency. Said out loud because a silent fallback here
+                    // would quietly reintroduce the invented imports this change removes.
+                    warning!(
+                        builder.package_context.log,
+                        "Package {} ({}): export bundle {} of imported package {} has no public export that this package already imports, falling back to the last public export. Its import map will gain an entry the original did not have.",
+                        builder.package_id,
+                        builder.zen_package.package_name(),
+                        from_bundle_index,
+                        resolved_import_package.package_name()
+                    );
+                }
+
+                let from_export_bundle_entry = match already_imported
+                    .or_else(|| bundle_entries.iter().rev().find(|e| is_public(e) && e.command_type == preferred_command))
                     .or_else(|| bundle_entries.iter().rev().find(|e| is_public(e)))
                 {
                     Some(entry) => *entry,
