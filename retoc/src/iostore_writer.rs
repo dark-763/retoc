@@ -9,10 +9,36 @@ use anyhow::{Context, Result};
 use fs_err as fs;
 use rayon::prelude::*;
 use std::io::Cursor;
+use std::sync::OnceLock;
 use std::{
     io::{BufWriter, Seek, Write},
     path::{Path, PathBuf},
 };
+
+/// Отдельный пул потоков, и только для сжатия блоков.
+///
+/// Сжатие вызывается из цикла записи контейнера, а в `to-zen` этот цикл крутится
+/// ВНУТРИ rayon-области: конвертация пакетов идёт по глобальному пулу и отдаёт
+/// готовое через канал нулевой ёмкости, то есть каждый отправитель ждёт, пока
+/// получатель заберёт.
+///
+/// Если брать потоки для сжатия из того же глобального пула, получается кольцо:
+/// поток-получатель, заблокировавшись на параллельном сжатии, начинает воровать
+/// задачи конвертации, они упираются в отправку в канал, принять которую некому -
+/// и всё встаёт. Наблюдалось именно так: два часа работы, шесть секунд
+/// процессорного времени, 60 МБ памяти.
+///
+/// Отдельный пул разрывает кольцо: его потоки в канал не отправляют никогда.
+static COMPRESSION_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+
+fn compression_pool() -> &'static rayon::ThreadPool {
+    COMPRESSION_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|index| format!("retoc-compress-{index}"))
+            .build()
+            .expect("failed to build the compression thread pool")
+    })
+}
 
 pub struct IoStoreWriter {
     #[allow(unused)]
@@ -89,17 +115,18 @@ impl IoStoreWriter {
         // даёт выигрыш, неужавшиеся пишутся с методом 0 - оригинальный кукер
         // поступает так же.
         let compressed: Vec<Option<Vec<u8>>> = match method {
-            Some(method) => data
-                .par_chunks(block_size)
-                .map(|block| {
-                    let mut buffer: Vec<u8> = Vec::new();
-                    if compress(method, block, Cursor::new(&mut buffer)).is_ok() && buffer.len() < block.len() {
-                        Some(buffer)
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
+            Some(method) => compression_pool().install(|| {
+                data.par_chunks(block_size)
+                    .map(|block| {
+                        let mut buffer: Vec<u8> = Vec::new();
+                        if compress(method, block, Cursor::new(&mut buffer)).is_ok() && buffer.len() < block.len() {
+                            Some(buffer)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }),
             None => Vec::new(),
         };
 
