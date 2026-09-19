@@ -1043,8 +1043,24 @@ fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_l
 
     for node in node_order {
         let node_bundle_index = *export_to_bundle_map.get(&node).unwrap();
-        for dependency in export_dependencies.get(&node).unwrap_or(&Vec::new()) {
-            create_dependency_arc_from_node(node_bundle_index as i32, dependency, builder);
+        let no_dependencies: Vec<ZenDependencyGraphNode> = Vec::new();
+        let node_dependencies = export_dependencies.get(&node).unwrap_or(&no_dependencies);
+
+        // Порядок внутри узла тоже кукерский, и он не совпадает с порядком, в котором
+        // этот список собран. Кукер читает таблицу preload dependencies подряд, четырьмя
+        // группами, как они в ней лежат: SerializeBeforeSerialize, CreateBeforeSerialize,
+        // SerializeBeforeCreate, CreateBeforeCreate. Первые две ведут в узел Serialize,
+        // вторые две - в узел Create, и в обеих парах группа с фазой источника Serialize
+        // идёт первой. Поэтому для любого узла достаточно обойти сначала зависимости с
+        // типом команды Serialize, потом с Create, сохраняя порядок внутри группы.
+        //
+        // Сам список собран в порядке Package Store Optimizer (он группирует наоборот) и
+        // в таком виде нужен и топологической сортировке, и ветке UE5, поэтому
+        // переставляем только здесь, при обходе.
+        for command_type in [EExportCommandType::Serialize, EExportCommandType::Create] {
+            for dependency in node_dependencies.iter().filter(|x| x.command_type == command_type) {
+                create_dependency_arc_from_node(node_bundle_index as i32, dependency, builder);
+            }
         }
     }
 
@@ -1628,6 +1644,13 @@ fn cooker_arc_less(left: (i32, i32), right: (i32, i32)) -> bool {
 ///
 /// Longer blocks would take the introsort's quicksort and heapsort branches, which are
 /// not reproduced here; the caller warns when it meets one.
+///
+/// Measured on the reference container, over arcs created in the cooker's order: this
+/// sort moves 1613 of the 100 991 blocks, and without it the byte-identical count drops
+/// from 100 987 to 99 375. It is not idempotent, and neither is the cooker: exactly one
+/// block of the shipped container - `B_GM_MainMenu`'s arcs from `BP_GM_Base_SRTE` - is
+/// stored in an order this sort would move, which is only possible because the cooker
+/// sorted a different input. A comparator that is a real ordering could not do that.
 fn sort_arcs_like_cooker(arcs: &mut [(i32, i32)]) {
     if arcs.len() < 2 {
         return;
