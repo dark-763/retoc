@@ -856,6 +856,13 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
         }
     }
 
+    // A filter that matches nothing used to run to completion and write an empty container
+    // with a zero exit code, which reads exactly like a successful build. Fail instead.
+    if !args.filter.is_empty() && asset_paths.is_empty() && shader_lib_paths.is_empty() {
+        bail!("--filter {} matched no asset in the input: nothing would be converted. Check the spelling of the filter, or drop it to convert everything.",
+            args.filter.iter().map(|f| format!("'{f}'")).collect::<Vec<_>>().join(", "));
+    }
+
     // Convert shader libraries first, since the data contained in their asset metadata is needed to build the package store entries
     let mut package_name_to_referenced_shader_maps: HashMap<String, Vec<FSHAHash>> = HashMap::new();
     for path in shader_lib_paths {
