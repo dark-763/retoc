@@ -1017,25 +1017,34 @@ fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_l
         });
     }
 
-    // Build internal and external dependency arcs
-    for export_index in 0..builder.zen_package.export_map.len() {
-        let export_create_node = ZenDependencyGraphNode {
-            package_index: FPackageIndex::create_export(export_index as u32),
-            command_type: EExportCommandType::Create,
-        };
-        let export_serialize_node = ZenDependencyGraphNode {
-            package_index: FPackageIndex::create_export(export_index as u32),
-            command_type: EExportCommandType::Serialize,
-        };
+    // Build internal and external dependency arcs.
+    //
+    // Порядок обхода узлов здесь виден в результате и потому не произволен. Кукер
+    // добавляет арки, идя по ГЛОБАЛЬНОМУ порядку загрузки узлов: для пакета-получателя
+    // это порядок его узлов по бандлам, то есть ровно порядок записей
+    // `export_bundle_entries`, а не порядок индексов экспортов. Дальше блок арок
+    // сортируется компаратором кукера, а тот непоследователен (см.
+    // `sort_arcs_like_cooker`), поэтому его результат зависит от порядка на входе:
+    // из 2020 блоков с двумя и более арками в проверяемом контейнере 29 дают разный
+    // результат при разных перестановках входа.
+    //
+    // Раньше обход шёл по `export_index`, Create затем Serialize для каждого
+    // экспорта. Совпадало это с порядком по бандлам только у пакетов, где раскладка
+    // не переставляет узлы.
+    let node_order: Vec<ZenDependencyGraphNode> = builder
+        .zen_package
+        .export_bundle_entries
+        .iter()
+        .map(|entry| ZenDependencyGraphNode {
+            package_index: FPackageIndex::create_export(entry.local_export_index),
+            command_type: entry.command_type,
+        })
+        .collect();
 
-        let export_create_bundle_index = *export_to_bundle_map.get(&export_create_node).unwrap();
-        let export_serialize_bundle_index = *export_to_bundle_map.get(&export_serialize_node).unwrap();
-
-        for export_create_dependency in export_dependencies.get(&export_create_node).unwrap_or(&Vec::new()) {
-            create_dependency_arc_from_node(export_create_bundle_index as i32, export_create_dependency, builder);
-        }
-        for export_serialize_dependency in export_dependencies.get(&export_serialize_node).unwrap_or(&Vec::new()) {
-            create_dependency_arc_from_node(export_serialize_bundle_index as i32, export_serialize_dependency, builder);
+    for node in node_order {
+        let node_bundle_index = *export_to_bundle_map.get(&node).unwrap();
+        for dependency in export_dependencies.get(&node).unwrap_or(&Vec::new()) {
+            create_dependency_arc_from_node(node_bundle_index as i32, dependency, builder);
         }
     }
 
