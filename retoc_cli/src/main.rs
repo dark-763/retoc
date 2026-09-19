@@ -700,11 +700,22 @@ fn action_to_legacy(args: ActionToLegacy, config: Arc<Config>) -> Result<()> {
 
 fn action_to_legacy_inner(args: ActionToLegacy, config: Arc<Config>, file_writer: &dyn FileWriterTrait, log: &Log) -> Result<()> {
     let iostore = iostore::open(&args.input, config.clone())?;
+    let mut matched = 0usize;
+    let mut ran = false;
     if !args.no_assets {
-        action_to_legacy_assets(&args, file_writer, &*iostore, log)?;
+        matched += action_to_legacy_assets(&args, file_writer, &*iostore, log)?;
+        ran = true;
     }
     if !args.no_shaders {
-        action_to_legacy_shaders(&args, file_writer, &*iostore, log)?;
+        matched += action_to_legacy_shaders(&args, file_writer, &*iostore, log)?;
+        ran = true;
+    }
+    // A filter that matches nothing used to extract nothing and exit successfully,
+    // which reads exactly like a finished extraction. Same guard as `to-zen` has.
+    if ran && matched == 0 && !args.filter.is_empty() {
+        bail!("--filter {} matched nothing in {:?}: no package and no shader library was extracted. Check the spelling of the filter, or drop it to extract everything.",
+            args.filter.iter().map(|f| format!("'{f}'")).collect::<Vec<_>>().join(", "),
+            args.input);
     }
     if !args.no_script_objects && iostore.container_file_version().is_some() && iostore.container_file_version().unwrap() > EIoStoreTocVersion::PerfectHash {
         let script_objects = iostore.load_script_objects()?;
@@ -719,7 +730,7 @@ fn progress_style() -> indicatif::ProgressStyle {
     indicatif::ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {wide_msg}").unwrap().progress_chars("##-")
 }
 
-fn action_to_legacy_assets(args: &ActionToLegacy, file_writer: &dyn FileWriterTrait, iostore: &dyn IoStoreTrait, log: &Log) -> Result<()> {
+fn action_to_legacy_assets(args: &ActionToLegacy, file_writer: &dyn FileWriterTrait, iostore: &dyn IoStoreTrait, log: &Log) -> Result<usize> {
     let mut packages_to_extract = vec![];
     for package_info in iostore.packages() {
         let chunk_id = FIoChunkId::from_package_id(package_info.id(), 0, EIoChunkType::ExportBundleData);
@@ -786,10 +797,10 @@ fn action_to_legacy_assets(args: &ActionToLegacy, file_writer: &dyn FileWriterTr
         );
     }
 
-    Ok(())
+    Ok(count)
 }
 
-fn action_to_legacy_shaders(args: &ActionToLegacy, file_writer: &dyn FileWriterTrait, iostore: &dyn IoStoreTrait, log: &Log) -> Result<()> {
+fn action_to_legacy_shaders(args: &ActionToLegacy, file_writer: &dyn FileWriterTrait, iostore: &dyn IoStoreTrait, log: &Log) -> Result<usize> {
     let compress_shaders = !args.no_compres_shaders;
     let mut libraries_extracted = 0;
     for chunk_info in iostore.chunks().filter(|x| x.id().get_chunk_type() == EIoChunkType::ShaderCodeLibrary) {
@@ -811,7 +822,7 @@ fn action_to_legacy_shaders(args: &ActionToLegacy, file_writer: &dyn FileWriterT
 
     info!(log, "Extracted {} shader code libraries to {:?}", libraries_extracted, args.output);
 
-    Ok(())
+    Ok(libraries_extracted)
 }
 
 fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
