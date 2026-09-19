@@ -1584,6 +1584,67 @@ pub struct ConvertedZenAssetBundle {
     legacy_external_arc_fixup_data: Vec<ZenLegacyPackageExternalArcFixupData>,
     legacy_export_bundle_mapping_data: Vec<ZenLegacyPackageExportBundleMapping>,
 }
+/// Blocks longer than this fall outside the branch of the cooker's sort reproduced by
+/// [`sort_arcs_like_cooker`]. The largest block of the reference container holds 4 arcs,
+/// and blocks of one arc make up 98 971 of its 100 991 blocks.
+const COOKER_SHORT_SORT_LIMIT: usize = 8;
+
+/// The comparator the cooker sorts each arc block with, reproduced as written rather
+/// than as intended: when the two `from` are equal it compares `to` against `to`, but
+/// when they differ it compares the LEFT arc's `from` against the RIGHT arc's `to`.
+///
+/// The mistake is not cosmetic - it is observable in the shipped data. In the reference
+/// container 28 of the 100 991 arc blocks are stored in an order that plain ascending
+/// `(from, to)` does not produce, and every one of them is explained by this comparison.
+///
+/// Comparison is unsigned because the cooker's arc fields are `uint32`. retoc carries
+/// the same values in `i32`, so the base-game arcs, which the cooker writes with
+/// `MAX_uint32` as their source bundle and retoc holds as `-1`, have to come out
+/// greatest by `from`, not least.
+fn cooker_arc_less(left: (i32, i32), right: (i32, i32)) -> bool {
+    if left.0 == right.0 {
+        (left.1 as u32) < (right.1 as u32)
+    } else {
+        (left.0 as u32) < (right.1 as u32)
+    }
+}
+
+/// Orders one block of arcs the way the cooker leaves it.
+///
+/// The cooker sorts with the engine's general-purpose sort, which is an introsort, and
+/// for ranges of [`COOKER_SHORT_SORT_LIMIT`] elements or fewer that introsort takes a
+/// separate branch: while the upper bound is above the lower, scan left to right
+/// keeping a running maximum (replaced whenever the comparator says the running maximum
+/// is less than the element), swap that maximum with the last element of the range, and
+/// move the upper bound down by one. That is a selection sort.
+///
+/// Which algorithm it is matters here. [`cooker_arc_less`] is not a consistent ordering,
+/// so different sorting algorithms leave the same input in different orders, and so does
+/// the same algorithm fed the same arcs in a different order: of the 2020 multi-arc
+/// blocks of the reference container, 29 have two possible results depending on the
+/// order the arcs arrive in. Reproducing "a sort by the comparator" is therefore not
+/// enough - it has to be this algorithm, over arcs created in the cooker's own order
+/// (see the node walk in `build_zen_dependency_bundles_legacy`).
+///
+/// Longer blocks would take the introsort's quicksort and heapsort branches, which are
+/// not reproduced here; the caller warns when it meets one.
+fn sort_arcs_like_cooker(arcs: &mut [(i32, i32)]) {
+    if arcs.len() < 2 {
+        return;
+    }
+    let mut upper = arcs.len() - 1;
+    while upper > 0 {
+        let mut running_max = 0;
+        for index in 1..=upper {
+            if cooker_arc_less(arcs[running_max], arcs[index]) {
+                running_max = index;
+            }
+        }
+        arcs.swap(running_max, upper);
+        upper -= 1;
+    }
+}
+
 impl ConvertedZenAssetBundle {
     pub fn package_data_size(&self) -> usize {
         self.package_buffer.len()
@@ -1655,18 +1716,20 @@ impl ConvertedZenAssetBundle {
         // within the same imported package) actually be recognized as duplicates and
         // collapsed - see TASK.md for why this can't be done any earlier.
         if !self.legacy_external_arc_serialized_offsets.is_empty() {
-            self.dedup_legacy_dependency_arcs()?;
+            self.dedup_and_sort_legacy_dependency_arcs(log)?;
         }
         Ok(())
     }
 
     /// Removes exact-duplicate (from, to) legacy dependency arcs within each imported
-    /// package's block of the graph region, now that `from_export_bundle_index` has
-    /// been resolved to its real value by the fixup loop above. Two arcs created from
-    /// different imports of the same external package can easily resolve to the exact
-    /// same (from, to) pair once we know which bundle of that package they each landed
-    /// in - the original cooker only ever stores such a pair once (see TASK.md, "arc
-    /// dedup" investigation).
+    /// package's block of the graph region, then puts each block into the order the
+    /// cooker would leave it in, now that `from_export_bundle_index` has been resolved
+    /// to its real value by the fixup loop above. Two arcs created from different
+    /// imports of the same external package can easily resolve to the exact same
+    /// (from, to) pair once we know which bundle of that package they each landed in -
+    /// the original cooker only ever stores such a pair once (see TASK.md, "arc dedup"
+    /// investigation). Both steps need the real `from`, which is why they live here and
+    /// not where the arcs are created.
     ///
     /// Operates directly on the already-serialized `package_buffer` bytes rather than
     /// on the (long gone, by this point) `ZenPackageHeader` struct: this pass runs once
@@ -1676,7 +1739,7 @@ impl ConvertedZenAssetBundle {
     /// versions <= Initial (see `FZenPackageHeader::serialize`), so shrinking it only
     /// requires splicing bytes out of the buffer and patching `graph_data_size` in the
     /// package summary - nothing before or after it needs to move or change.
-    fn dedup_legacy_dependency_arcs(&mut self) -> anyhow::Result<()> {
+    fn dedup_and_sort_legacy_dependency_arcs(&mut self, log: &Log) -> anyhow::Result<()> {
         // Byte offset of `graph_data_offset`/`graph_data_size` within FZenPackageSummary
         // for container header versions <= Initial: name (FMappedName, 8) + source_name
         // (FMappedName, 8) + package_flags (4) + cooked_header_size (4) + 4 name map
@@ -1710,10 +1773,22 @@ impl ConvertedZenAssetBundle {
                 arcs.push((reader.de()?, reader.de()?));
             }
 
-            // Deduplicate while preserving first-seen order, so unrelated arcs that
-            // happen to already be unique keep their original relative position
+            // Deduplicate while preserving first-seen order, matching the cooker, which
+            // only ever appends an arc it has not got yet
             let mut seen: HashSet<(i32, i32)> = HashSet::with_capacity(arcs.len());
             arcs.retain(|arc| seen.insert(*arc));
+
+            if arcs.len() > COOKER_SHORT_SORT_LIMIT {
+                warning!(
+                    log,
+                    "{}: the graph block for package {} holds {} arcs. Only the short branch of the cooker's sort is reproduced here (it covers blocks of {} arcs or fewer, which is every block of every container checked so far), so the order of this block may differ from an original cook. The arcs themselves are unaffected.",
+                    self.path,
+                    package_id,
+                    arcs.len(),
+                    COOKER_SHORT_SORT_LIMIT
+                );
+            }
+            sort_arcs_like_cooker(&mut arcs);
 
             new_graph_data.ser(&package_id)?;
             new_graph_data.ser(&(arcs.len() as u32))?;
@@ -1723,22 +1798,26 @@ impl ConvertedZenAssetBundle {
             }
         }
 
-        let bytes_removed = graph_data_size as usize - new_graph_data.len();
-        if bytes_removed == 0 {
+        // Sorting changes the bytes without changing their number, so "nothing was
+        // removed" is no longer a reason to skip the write - compare the bytes instead
+        if new_graph_data == self.package_buffer[graph_start..graph_end] {
             return Ok(());
         }
 
+        let bytes_removed = graph_data_size as usize - new_graph_data.len();
         self.package_buffer.splice(graph_start..graph_end, new_graph_data.iter().copied());
 
-        let new_graph_data_size = new_graph_data.len() as i32;
-        let mut writer = Cursor::new(&mut self.package_buffer);
-        writer.seek(SeekFrom::Start(GRAPH_DATA_SIZE_FIELD_POS))?;
-        writer.ser(&new_graph_data_size)?;
+        if bytes_removed != 0 {
+            let new_graph_data_size = new_graph_data.len() as i32;
+            let mut writer = Cursor::new(&mut self.package_buffer);
+            writer.seek(SeekFrom::Start(GRAPH_DATA_SIZE_FIELD_POS))?;
+            writer.ser(&new_graph_data_size)?;
 
-        // header_size (graph_data_offset + graph_data_size) shrank by the same amount,
-        // and export_bundles_size is header_size + sum of export sizes - see
-        // FZenPackageHeader::serialize
-        self.store_entry.export_bundles_size -= bytes_removed as u64;
+            // header_size (graph_data_offset + graph_data_size) shrank by the same amount,
+            // and export_bundles_size is header_size + sum of export sizes - see
+            // FZenPackageHeader::serialize
+            self.store_entry.export_bundles_size -= bytes_removed as u64;
+        }
         Ok(())
     }
 
@@ -1889,6 +1968,46 @@ mod test {
             FPackageObjectIndex::create_script_import("/Script/UMG.WidgetTree").value(),
             Some(4813877483002703682)
         );
+    }
+
+    /// Blocks taken out of the shipped container, chosen because a plain ascending sort
+    /// gets them wrong: they are the visible effect of the comparator's mistake. Each
+    /// input is the order in which the cooker created the arcs, each expectation is the
+    /// order the original container stores.
+    #[test]
+    fn cooker_sort_reproduces_blocks_from_the_shipped_container() {
+        let cases: [(&[(i32, i32)], &[(i32, i32)]); 4] = [
+            // /Game/SRTP/Level/New_Lindcliff/Test/Lindcliff_ParkSlums, from 12737162781366012979.
+            // The only input that produces this block is the block itself: what the sort
+            // has to do here is leave it alone where a plain sort would reorder it.
+            (&[(1, 2), (0, 2)], &[(1, 2), (0, 2)]),
+            // /Game/A/1_Systems/Character/B_Character_NPC, from 11643695686782840066
+            (&[(1, 1), (0, 1), (0, 2)], &[(0, 1), (1, 1), (0, 2)]),
+            // /Game/A/1_Systems/Character/B_Character_NPC, from 7653743660621681353
+            (&[(0, 1), (1, 1), (0, 2), (0, 0)], &[(0, 0), (0, 1), (1, 1), (0, 2)]),
+            // /Game/A/Menu/Level/B_GM_MainMenu, from 8836315499911210096
+            (&[(0, 0), (0, 1), (1, 1), (2, 1)], &[(0, 0), (0, 1), (2, 1), (1, 1)]),
+        ];
+        for (input, expected) in cases {
+            let mut arcs = input.to_vec();
+            sort_arcs_like_cooker(&mut arcs);
+            assert_eq!(arcs, expected, "input {input:?}");
+            // ... and a plain ascending sort would not have produced it
+            let mut plain = input.to_vec();
+            plain.sort();
+            assert_ne!(plain, expected, "input {input:?} is not a case the comparator's mistake shows in");
+        }
+    }
+
+    /// Base-game arcs carry `MAX_uint32` as their source bundle, which retoc holds as
+    /// `-1`. Comparing them signed would make them the smallest instead of the largest.
+    #[test]
+    fn base_game_arcs_compare_as_unsigned() {
+        assert!(cooker_arc_less((0, 0), (-1, 1)));
+        assert!(!cooker_arc_less((-1, 0), (-1, 0)));
+        let mut arcs = vec![(-1, 0), (0, 0)];
+        sort_arcs_like_cooker(&mut arcs);
+        assert_eq!(arcs, vec![(0, 0), (-1, 0)]);
     }
 
     // Builds zen asset and returns the resulting package ID, chunk data buffer, and it's store entry. Zen package conversion does not modify bulk data in any way.
