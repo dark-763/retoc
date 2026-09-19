@@ -1216,7 +1216,13 @@ mod test {
     fn test_read_container_shader_library() -> anyhow::Result<()> {
         let mut stream = BufReader::new(fs::File::open("tests/UE5.4/ShaderArchive-Global-PCD3D_SM6-PCD3D_SM6.ushaderbytecode")?);
 
-        let shader_library_header = ser_hex::read("out/read_container_shader_library.trace.json", &mut stream, |x| {
+        // Путь трассировки - во временный каталог. Раньше он был "out/..." рядом с
+        // репозиторием, и тест молча полагался на то, что каталог создаст какой-то
+        // другой тест: своего `create_dir` у него нет.
+        let trace = std::env::temp_dir().join("retoc-test-shader-library");
+        fs::create_dir_all(&trace)?;
+        let trace = trace.join("read_container_shader_library.trace.json");
+        let shader_library_header = ser_hex::read(&trace, &mut stream, |x| {
             let library_version: u32 = x.de()?;
             assert_eq!(library_version, 1, "expected shader library header version to be initial");
             FIoStoreShaderCodeArchiveHeader::deserialize(x, EIoStoreShaderLibraryVersion::Initial)

@@ -269,8 +269,11 @@ mod test {
             op.unwrap_object()["packagestoreentry"].unwrap_uniform_object()["packagename"].unwrap_string()
         });
 
-        fs::create_dir("out").ok();
-        fs::write("out/packagestore.json", serde_json::to_vec(&field)?)?;
+        // Во временный каталог, а не в "out" рядом с репозиторием: иначе после
+        // каждого `cargo test` в рабочем дереве появляются неотслеживаемые файлы.
+        let out = std::env::temp_dir().join("retoc-test-compact-binary");
+        fs::create_dir_all(&out)?;
+        fs::write(out.join("packagestore.json"), serde_json::to_vec(&field)?)?;
 
         Ok(())
     }

@@ -170,8 +170,11 @@ mod test {
 
     #[test]
     fn test_write_container() -> Result<()> {
-        fs::create_dir("out").ok();
-        let mut writer = IoStoreWriter::new("out/new.utoc", EIoStoreTocVersion::PerfectHashWithOverflow, Some(EIoContainerHeaderVersion::OptionalSegmentPackages), "../../..".into())?;
+        // Во временный каталог, а не в "out" рядом с репозиторием: иначе после
+        // каждого `cargo test` в рабочем дереве появляются неотслеживаемые файлы.
+        let out = std::env::temp_dir().join("retoc-test-iostore-writer");
+        fs::create_dir_all(&out)?;
+        let mut writer = IoStoreWriter::new(out.join("new.utoc"), EIoStoreTocVersion::PerfectHashWithOverflow, Some(EIoContainerHeaderVersion::OptionalSegmentPackages), "../../..".into())?;
 
         let data = fs::read("tests/UE5.3/ScriptObjects.bin")?;
         writer.write_chunk_raw(FIoChunkIdRaw { id: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5] }, Some(UEPath::new("../../../asdf/asdf/dasf/script_objects.bin")), &data)?;
