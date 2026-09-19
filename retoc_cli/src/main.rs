@@ -595,23 +595,44 @@ fn action_unpack_raw(args: ActionUnpackRaw, config: Arc<Config>) -> Result<()> {
     package_store_entries: Default::default(),
 };
 
-for chunk in iostore.chunks() {
-    let data = chunk.read()?;
-    fs::write(chunks_dir.join(hex::encode(chunk.id().get_raw())), data)?;
-    if let Some(path) = chunk.path() {
-        manifest.chunk_paths.insert(chunk.id().get_raw().into(), path);
-    }
-    if chunk.id().get_chunk_type() == EIoChunkType::ExportBundleData {
-        let package_id = FPackageId(chunk.id().get_chunk_id());
-        if let Some(store_entry) = iostore.package_store_entry(package_id) {
-            manifest.package_store_entries.insert(chunk.id().get_raw().into(), store_entry);
+    // Чтение, распаковка и запись идут по чанкам параллельно. Последовательно это
+    // было около трёх минут на контейнер, а за сборку распаковка делается дважды.
+    // Пул файловых дескрипторов для .ucas создаётся размером в число потоков rayon
+    // (`iostore.rs`, `FilePool::new`) - параллельное чтение здесь предусмотрено.
+    //
+    // В манифест результаты складываются потом, одним потоком: порядок в нём не
+    // важен (это отображения по id чанка), но так он не зависит от того, какой
+    // поток успел первым.
+    let all_chunks: Vec<_> = iostore.chunks().collect();
+    let chunk_count = all_chunks.len();
+    type UnpackedChunk = (FIoChunkIdRaw, Option<String>, Option<StoreEntry>);
+    let unpacked: Vec<UnpackedChunk> = all_chunks
+        .par_iter()
+        .map(|chunk| -> Result<UnpackedChunk> {
+            let data = chunk.read()?;
+            fs::write(chunks_dir.join(hex::encode(chunk.id().get_raw())), data)?;
+
+            let store_entry = if chunk.id().get_chunk_type() == EIoChunkType::ExportBundleData {
+                iostore.package_store_entry(FPackageId(chunk.id().get_chunk_id()))
+            } else {
+                None
+            };
+            Ok((chunk.id().get_raw(), chunk.path(), store_entry))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    for (chunk_id, path, store_entry) in unpacked {
+        if let Some(path) = path {
+            manifest.chunk_paths.insert(chunk_id.into(), path);
+        }
+        if let Some(store_entry) = store_entry {
+            manifest.package_store_entries.insert(chunk_id.into(), store_entry);
         }
     }
-}
 
     serde_json::to_writer_pretty(BufWriter::new(fs::File::create(manifest_path)?), &manifest)?;
 
-    println!("unpacked {} chunks to {}", iostore.chunks().count(), output.to_string_lossy());
+    println!("unpacked {} chunks to {}", chunk_count, output.to_string_lossy());
 
     Ok(())
 }
