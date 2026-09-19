@@ -495,8 +495,6 @@ struct ZenDependencyGraphNode {
     command_type: EExportCommandType,
 }
 
-static BUNDLE_LAYOUT_OVERRIDE: std::sync::OnceLock<HashMap<String, Vec<(u32, u32)>>> = std::sync::OnceLock::new();
-
 /// Layout and load order computed once for the whole container before any package is
 /// converted (see `bundle_layout_pass`). Held here rather than threaded through every
 /// signature because the per-package conversion already takes its layout from a process
@@ -510,225 +508,6 @@ pub fn set_container_bundle_layout(layout: ContainerBundleLayout) {
 
 fn container_bundle_layout() -> Option<&'static ContainerBundleLayout> {
     CONTAINER_BUNDLE_LAYOUT.get()
-}
-
-/// Необязательное переопределение разбивки на бандлы, снятое с оригинального
-/// контейнера игры. Используется только как проверочный/резервный путь поверх
-/// `compute_bundle_layout` - когда переменная окружения не задана, retoc
-/// целиком полагается на вычисленное правило. Путь к JSON задаётся через
-/// RETOC_BUNDLE_LAYOUT.
-fn json_bundle_layout_override(package_name: &str) -> Option<&'static Vec<(u32, u32)>> {
-    let map = BUNDLE_LAYOUT_OVERRIDE.get_or_init(|| {
-        let path = std::env::var("RETOC_BUNDLE_LAYOUT").unwrap_or_default();
-        if path.is_empty() {
-            return HashMap::new();
-        }
-        let data = std::fs::read_to_string(&path).unwrap_or_default();
-        let raw: HashMap<String, Vec<Vec<u32>>> = serde_json::from_str(&data).unwrap_or_default();
-        raw.into_iter()
-            .map(|(k, v)| {
-                let key = k
-                    .trim_end_matches(".uasset")
-                    .trim_end_matches(".umap")
-                    .to_lowercase();
-                let hdrs = v.into_iter().filter(|p| p.len() == 2).map(|p| (p[0], p[1])).collect();
-                (key, hdrs)
-            })
-            .collect()
-    });
-    if map.is_empty() {
-        return None;
-    }
-    map.get(&bundle_layout_key(package_name))
-}
-
-/// Ключи в JSON - пути внутри контейнера (`SRTE/Content/A/.../Name`,
-/// `Engine/Content/EngineSounds/.../Name`), а на вход приходит имя пакета
-/// (`/Game/A/.../Name`, `/Engine/EngineSounds/.../Name`). Отображение идёт по
-/// первому сегменту имени: это точка монтирования, и на диске ей соответствует
-/// каталог `<точка>/Content`, где `/Game` - это каталог проекта.
-///
-/// Раньше здесь была замена только `/Game` -> `SRTE/Content`, из-за чего ЛЮБАЯ
-/// запись не из game-контента молча не находилась: имя `/Engine/...` давало ключ
-/// `/engine/...`, а в JSON лежит `engine/content/...`. На проверяемом контейнере
-/// так терялись 2 записи из 1243 (`MasterSubmixDefault`,
-/// `MasterReverbSubmixDefault`), и расчётный остаток с полным JSON был 2, а не 0.
-///
-/// ОГРАНИЧЕНИЕ: поддерживаются только точки монтирования, лежащие прямо в корне
-/// контейнера - `/Game` и `/Engine`. Пакеты плагинов не поддерживаются: их точка
-/// монтирования не выводится из имени пакета. `/Niagara/Foo/X` лежит в контейнере
-/// по пути `Engine/Plugins/FX/Niagara/Content/Foo/X`, и промежуточные сегменты
-/// (`Plugins/FX`) в имени никак не представлены - чтобы их восстановить, нужна
-/// таблица путей самого контейнера, которой здесь нет. Для записи такого пакета в
-/// JSON ключ просто не совпадёт, и переопределение молча не применится. На
-/// проверяемом контейнере это безвредно: в `bundle_layout.json` 1241 запись
-/// `SRTE/Content` и 2 `Engine/Content`, плагинных нет.
-fn bundle_layout_key(package_name: &str) -> String {
-    // Имя каталога проекта на диске; в именах пакетов ему соответствует /Game.
-    const PROJECT_CONTENT_ROOT: &str = "SRTE";
-
-    let trimmed = package_name.trim_start_matches('/');
-    let (mount, rest) = trimmed.split_once('/').unwrap_or((trimmed, ""));
-    let root = if mount.eq_ignore_ascii_case("Game") { PROJECT_CONTENT_ROOT } else { mount };
-    format!("{root}/Content/{rest}").to_lowercase()
-}
-
-/// Вычисляет разбивку пакета на бандлы экспортов из уже построенного порядка
-/// загрузки (`export_load_order`), без обращения к оригинальному контейнеру.
-///
-/// Последовательность команд Create/Serialize в `export_load_order` совпадает
-/// с оригинальным кукером побайтово (see `sort_dependencies_in_load_order`) -
-/// это подтверждено сверкой на 1243 пакетах с несколькими бандлами. Остаётся
-/// только найти точки разреза этой последовательности на бандлы.
-///
-/// Разрез ставится сразу после команды Serialize, если следующая по порядку
-/// команда - это Create экспорта с МЕНЬШИМ индексом ("инверсия"): это значит,
-/// что кукер отложил создание чего-то раньше стоящего в файле до тех пор,
-/// пока не будет готово (сериализовано) что-то, обрабатываемое позже -
-/// настоящая перекрёстная зависимость между ветками дерева, а не просто
-/// порядок обхода.
-///
-/// Проверялся и более широкий вариант (следующая команда - Serialize с
-/// меньшим индексом, а не только Create), он ловит больше настоящих границ,
-/// но и режет пакеты, у которых в оригинале ровно один бандл: команда, чей
-/// Serialize отложен до конца пакета (например, объект по умолчанию класса,
-/// не распознанный как CDO по class_index), даёт ложное срабатывание. Такое
-/// расхождение обнаруживается только на пакетах ВНЕ множества с несколькими
-/// бандлами, поэтому проверка только по этому множеству (1243 пакета) его не
-/// ловит - см. TASK.md, пункт про сверку на всём проекте. Условие Create-only
-/// не даёт ни одного ложного срабатывания ни на одном из 17095 пакетов проекта.
-///
-/// Широкий вариант отвергнут как ОСНОВНОЕ правило, но его срабатывания не
-/// случайны: из 113 разрезов, которые Create-only правило пропускает, 84 имеют
-/// ровно эту форму. Поэтому поверх него добавлено СУЖАЮЩЕЕ условие по классам
-/// экспортов вокруг разреза (`is_clean_boundary`) - см. его комментарий и
-/// раздел "Описание 109 пропущенных разрезов" в TASK.md.
-///
-/// Правило подтверждено поэлементной сверкой позиций разрезов с оригинальным
-/// контейнером на ВСЕХ 17095 пакетах (одна игра, UE 4.26.2): точное совпадение
-/// раскладки у 17038 пакетов, 57 пропущенных разрезов и НИ ОДНОГО лишнего.
-/// Без сужающего условия было 16986 точных и 113 пропущенных, тоже без лишних.
-/// Ни в одном пакете число бандлов не совпало при неверном их составе.
-fn compute_bundle_layout(export_load_order: &[ZenExportGraphNode], export_map: &[FExportMapEntry]) -> Option<Vec<(u32, u32)>> {
-    compute_bundle_layout_cuts(export_load_order, export_map, false)
-}
-
-/// Классы, соседство с которыми на кандидате в разрез НИ РАЗУ не встретилось в
-/// пакете, у которого кукер оставил один бандл.
-///
-/// Получено замером по оригинальному контейнеру: широкое правило (разрез после
-/// Serialize, если у следующей команды меньший индекс) срабатывает 289 раз в 136
-/// пакетах, которые на самом деле однобандловые. Разбивка этих срабатываний и
-/// настоящих границ по классу экспорта дала полное разделение для трёх случаев:
-///
-/// | класс                       | настоящих границ | ложных |
-/// |-----------------------------|------------------|--------|
-/// | Function ПОСЛЕ разреза      |               55 |      0 |
-/// | WidgetTree ДО разреза       |               16 |      0 |
-/// | Function ДО разреза         |               11 |      0 |
-/// | класс-экспорт ДО разреза    |               12 |      0 |
-///
-/// Для сравнения, неразделимые случаи: BlueprintGeneratedClass после разреза -
-/// 27 настоящих против 132 ложных, SimpleConstructionScript до разреза - 17
-/// против 125. Их сюда включать нельзя.
-///
-/// Смысл: кукер закрывает бандл после инфраструктуры Blueprint'а (дерево
-/// виджетов, функции) и перед функциями класса; компоненты обычного актора
-/// (StaticMeshComponent, ChildActorComponent, SimpleConstructionScript), дающие
-/// всю массу ложных срабатываний, в этот набор не попадают.
-///
-/// "Класс-экспорт" - это когда class_index указывает на экспорт этого же пакета,
-/// то есть объект по умолчанию класса, сгенерированного здесь же.
-fn is_clean_boundary(before: &FExportMapEntry, after: &FExportMapEntry) -> bool {
-    static CLASSES: std::sync::OnceLock<(FPackageObjectIndex, FPackageObjectIndex)> = std::sync::OnceLock::new();
-    let (function, widget_tree) = CLASSES.get_or_init(|| {
-        (
-            FPackageObjectIndex::create_script_import("/Script/CoreUObject.Function"),
-            FPackageObjectIndex::create_script_import("/Script/UMG.WidgetTree"),
-        )
-    });
-
-    after.class_index == *function
-        || before.class_index == *function
-        || before.class_index == *widget_tree
-        || before.class_index.kind() == FPackageObjectIndexType::Export
-}
-
-/// Shared cut-finding logic behind `compute_bundle_layout`, parameterized on whether
-/// a cut is allowed after *any* command with a smaller next index (`wide`, the
-/// rejected variant described above - kept only as a diagnostic signal, see
-/// `warn_if_bundle_layout_uncertain`) or only after `Serialize` followed by a smaller
-/// `Create` (`!wide`, the actual production rule).
-fn compute_bundle_layout_cuts(export_load_order: &[ZenExportGraphNode], export_map: &[FExportMapEntry], wide: bool) -> Option<Vec<(u32, u32)>> {
-    let flat: Vec<(u32, EExportCommandType)> = export_load_order
-        .iter()
-        .filter(|n| n.node.package_index.is_export())
-        .map(|n| (n.node.package_index.to_export_index(), n.node.command_type))
-        .collect();
-
-    let mut layout = Vec::new();
-    let mut start = 0usize;
-    for i in 0..flat.len().saturating_sub(1) {
-        let (idx, cmd) = flat[i];
-        if cmd != EExportCommandType::Serialize {
-            continue;
-        }
-        let (next_idx, next_cmd) = flat[i + 1];
-        let is_cut = next_idx < idx
-            && (wide
-                || next_cmd == EExportCommandType::Create
-                || is_clean_boundary(&export_map[idx as usize], &export_map[next_idx as usize]));
-        if is_cut {
-            layout.push((start as u32, (i + 1 - start) as u32));
-            start = i + 1;
-        }
-    }
-    layout.push((start as u32, (flat.len() - start) as u32));
-
-    if layout.len() > 1 { Some(layout) } else { None }
-}
-
-/// Diagnostic-only cross-check, run whenever this package's bundle layout came from
-/// `compute_bundle_layout` rather than `RETOC_BUNDLE_LAYOUT` (a JSON entry means we
-/// have real ground truth already, nothing to warn about). It has no effect on the
-/// layout actually used - it only decides whether to print a warning.
-///
-/// The wide rule (cut after *any* command, not just `Serialize` -> smaller `Create`)
-/// was rejected as the production rule because it wrongly splits packages that have
-/// exactly one bundle in the original (see `compute_bundle_layout_cuts` doc comment
-/// and TASK.md). But that same over-eagerness makes it a useful uncertainty signal
-/// here: when it disagrees with the narrow rule on how many bundles a package needs,
-/// this package is in the same shape as the 109 (out of 1243) known cases where the
-/// narrow rule's Create-only condition misses the real boundary - there is no way to
-/// tell, from this package's own data alone, whether the narrow or the wide count (or
-/// neither) is actually correct; only the original container or RETOC_BUNDLE_LAYOUT
-/// can settle it. A wrong bundle count is not cosmetic: two builds differing in
-/// nothing but `export_bundle_count` on ten packages were run against the game, and
-/// the one with the computed layout hung on startup with no crash and no log while
-/// the one with `RETOC_BUNDLE_LAYOUT` played normally (see TASK.md, "Журнал опыта:
-/// сборка №2"). So this is worth surfacing even though it can't be resolved
-/// automatically.
-///
-/// This is a weak, partial signal, not a detector: measured on the full 17095-package
-/// project without RETOC_BUNDLE_LAYOUT, it flagged 12 packages, of which 7 were
-/// actually among the 109 known-wrong ones (the rest were cases where the narrow rule
-/// was already right and the wide rule would have been wrong). It misses the other
-/// 102 - both known 109-residual shapes (single-export native types, and Blueprint
-/// container exports that close without an index inversion at all) have no `next_idx
-/// < idx` step for either rule to catch. Absence of this warning is not a guarantee of
-/// a correct layout; presence of it is a reliable hint to check this specific package.
-fn warn_if_bundle_layout_uncertain(builder: &ZenPackageBuilder, export_load_order: &[ZenExportGraphNode], export_map: &[FExportMapEntry], narrow_layout: &[(u32, u32)]) {
-    if let Some(wide_layout) = compute_bundle_layout_cuts(export_load_order, export_map, true)
-        && wide_layout.len() != narrow_layout.len()
-    {
-        warning!(
-            builder.log,
-            "Package {} has an uncertain computed bundle layout: {} bundle(s) by the production rule, {} by a wider heuristic that catches more real boundaries but also false-positives on single-bundle packages. A wrong bundle count here has been observed to hang the game at startup with no crash and no log - verify against the original container or supply RETOC_BUNDLE_LAYOUT for this package before shipping.",
-            &builder.package_name,
-            narrow_layout.len(),
-            wide_layout.len()
-        );
-    }
 }
 
 fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_load_order: &[ZenExportGraphNode], export_dependencies: &HashMap<ZenDependencyGraphNode, Vec<ZenDependencyGraphNode>>) -> anyhow::Result<()> {
@@ -800,39 +579,44 @@ fn build_zen_dependency_bundles_legacy(builder: &mut ZenPackageBuilder, export_l
     }
 
     // Для версий Initial и старше кукер иногда делит пакет на несколько бандлов
-    // экспортов. Выше уже построен один бандл на весь пакет - если разбивка
-    // (вычисленная, либо взятая из RETOC_BUNDLE_LAYOUT, когда он задан и
-    // содержит запись для этого пакета) требует большего числа бандлов,
-    // применяем её здесь.
+    // экспортов. Выше уже построен один бандл на весь пакет - если раскладка,
+    // посчитанная предпроходом по всему контейнеру, требует большего числа
+    // бандлов, применяем её здесь.
     if builder.container_header_version <= EIoContainerHeaderVersion::Initial {
-        // Order of preference: RETOC_BUNDLE_LAYOUT as a manual override, then the
-        // container-wide pass, then the standalone heuristic. The pass knows every
-        // package of the container, so a package missing from it means the pass never
-        // saw it - that is an error at the caller, not something to paper over with a
-        // plausible guess: a wrong layout has been observed to hang the game silently.
-        let json_layout = json_bundle_layout_override(&builder.package_name).cloned();
-        let pass_layout = match container_bundle_layout() {
-            Some(pass) if json_layout.is_none() => {
-                let computed = pass.layout_of(builder.package_id).ok_or_else(|| {
-                    anyhow!(
-                        "Package {} ({}) was not seen by the bundle layout pass, so its export bundle layout is unknown. Run the conversion over the whole input directory, or supply RETOC_BUNDLE_LAYOUT covering this package.",
-                        builder.package_name,
-                        builder.package_id
-                    )
-                })?;
-                Some(computed.clone())
+        // The layout comes from the container-wide pass and from nowhere else. A package
+        // the pass has not seen is an error at the caller, not something to paper over
+        // with a plausible guess: a wrong bundle count has been observed to hang the
+        // game at startup with no crash and no log.
+        //
+        // With no pass published at all - a single asset converted through the library
+        // rather than through `to-zen` - the package keeps the one bundle built above.
+        // That is what a package without cuts gets anyway, and the only honest answer
+        // when the rest of the container is unknown: the cooker decides these cuts from
+        // the whole container's load order, so no rule reading this package alone can
+        // reproduce them. The heuristic that used to stand here reached 17038 of 17095
+        // packages, and its misses are silent.
+        let layout = match container_bundle_layout() {
+            Some(pass) => Some(
+                pass.layout_of(builder.package_id)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Package {} ({}) was not seen by the bundle layout pass, so its export bundle layout is unknown. Run the conversion over the whole input directory.",
+                            builder.package_name,
+                            builder.package_id
+                        )
+                    })?
+                    .clone(),
+            ),
+            None => {
+                warning!(
+                    builder.log,
+                    "Package {} is being converted to a UE4 container without a container-wide bundle layout pass, so it gets a single export bundle. If the original cook split it, the result will not match and can hang the game - convert the whole input directory in one run instead.",
+                    &builder.package_name
+                );
+                None
             }
-            _ => None,
         };
-        let export_map = builder.zen_package.export_map.clone();
-        let layout = json_layout
-            .clone()
-            .or(pass_layout)
-            .or_else(|| compute_bundle_layout(export_load_order, &export_map));
         if let Some(layout) = layout {
-            if json_layout.is_none() {
-                warn_if_bundle_layout_uncertain(builder, export_load_order, &export_map, &layout);
-            }
             let total = builder.zen_package.export_bundle_entries.len() as u32;
             let sum: u32 = layout.iter().map(|(_, c)| *c).sum();
             if sum == total {
@@ -1963,35 +1747,6 @@ mod test {
     use crate::version::EngineVersion;
     use crate::{EIoStoreTocVersion, PackageTestMetadata};
     use fs_err as fs;
-
-    /// `RETOC_BUNDLE_LAYOUT` keys are container paths while lookups come in as package
-    /// names. Only the two mount points that sit directly at the container root are
-    /// covered; see `bundle_layout_key` for why plugins are not.
-    #[test]
-    fn bundle_layout_key_maps_root_mount_points() {
-        assert_eq!(bundle_layout_key("/Game/A/Menu/WBP_Settings"), "srte/content/a/menu/wbp_settings");
-        assert_eq!(
-            bundle_layout_key("/Engine/EngineSounds/Submixes/MasterSubmixDefault"),
-            "engine/content/enginesounds/submixes/mastersubmixdefault"
-        );
-    }
-
-    /// The two class paths `is_clean_boundary` keys on must hash to the script objects
-    /// the cooker actually recorded, or the narrowing condition silently never fires
-    /// and the bundle layout quietly regresses to the Create-only rule. These indices
-    /// were read out of the shipped `global.utoc` of the UE 4.26.2 title the rule was
-    /// measured on, via `retoc print-script-objects`.
-    #[test]
-    fn clean_boundary_class_paths_match_script_objects() {
-        assert_eq!(
-            FPackageObjectIndex::create_script_import("/Script/CoreUObject.Function").value(),
-            Some(6291290835964162768)
-        );
-        assert_eq!(
-            FPackageObjectIndex::create_script_import("/Script/UMG.WidgetTree").value(),
-            Some(4813877483002703682)
-        );
-    }
 
     /// Blocks taken out of the shipped container, chosen because a plain ascending sort
     /// gets them wrong: they are the visible effect of the comparator's mistake. Each

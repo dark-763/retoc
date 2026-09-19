@@ -4,8 +4,7 @@
 //! single pass over every package of the container at once, so neither can be derived
 //! from one package on its own. This module reproduces that pass from the legacy
 //! packages before any of them is converted, and hands the result to the per-package
-//! conversion, which keeps taking its layout from the outside exactly as it did when
-//! that layout came from `RETOC_BUNDLE_LAYOUT`.
+//! conversion, which takes its layout from here and from nowhere else.
 //!
 //! Written from a prose description of the 4.26 algorithm; no engine code was copied.
 //! The steps are lettered to match the notes in TASK.md:
