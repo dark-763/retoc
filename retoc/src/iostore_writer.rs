@@ -7,6 +7,7 @@ use crate::{EIoStoreTocVersion, FIoChunkHash, FIoChunkId, FIoContainerId, FIoOff
 use crate::compression::{CompressionMethod, compress};
 use anyhow::{Context, Result};
 use fs_err as fs;
+use rayon::prelude::*;
 use std::io::Cursor;
 use std::{
     io::{BufWriter, Seek, Write},
@@ -71,30 +72,46 @@ impl IoStoreWriter {
 
         let start_block = self.toc.compression_blocks.len();
 
+        // Хеш считается по несжатым данным - так же, как в оригинале. Блоки идут
+        // подряд и вместе составляют `data`, поэтому обновление по блокам и одно
+        // обновление целиком дают один и тот же хеш.
         let mut hasher = blake3::Hasher::new();
-        let mut compressed_buffer: Vec<u8> = Vec::new();
-        for block in data.chunks(self.toc.compression_block_size as usize) {
-            // Хеш считается по несжатым данным - так же, как в оригинале.
-            hasher.update(block);
-            let uncompressed_size = block.len() as u32;
+        hasher.update(data);
 
-            // Блок сжимается, только если это даёт выигрыш. Неужавшиеся блоки
-            // пишутся как есть с методом 0 - оригинальный кукер поступает так же.
-            let mut compression_method_index = 0u8;
-            if let Some(method) = self.compression_method {
-                compressed_buffer.clear();
-                if compress(method, block, Cursor::new(&mut compressed_buffer)).is_ok()
-                    && compressed_buffer.len() < block.len()
-                {
-                    compression_method_index = 1;
-                }
-            }
+        let block_size = self.toc.compression_block_size as usize;
+        let method = self.compression_method;
 
-            let payload: &[u8] = if compression_method_index == 0 { block } else { &compressed_buffer };
+        // Блоки сжимаются параллельно, а пишутся строго по порядку. Раньше и то и
+        // другое шло одним последовательным циклом: 18 ГБ порциями по 64 КБ на одном
+        // ядре из шестнадцати, и это была основная часть времени сборки контейнера.
+        //
+        // `None` означает "писать блок как есть": блок сжимается, только если это
+        // даёт выигрыш, неужавшиеся пишутся с методом 0 - оригинальный кукер
+        // поступает так же.
+        let compressed: Vec<Option<Vec<u8>>> = match method {
+            Some(method) => data
+                .par_chunks(block_size)
+                .map(|block| {
+                    let mut buffer: Vec<u8> = Vec::new();
+                    if compress(method, block, Cursor::new(&mut buffer)).is_ok() && buffer.len() < block.len() {
+                        Some(buffer)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+
+        for (index, block) in data.chunks(block_size).enumerate() {
+            let squeezed = compressed.get(index).and_then(|x| x.as_deref());
+            let compression_method_index = if squeezed.is_some() { 1u8 } else { 0u8 };
+            let payload: &[u8] = squeezed.unwrap_or(block);
+
             self.cas_stream.write_all(payload)?;
             let compressed_size = payload.len() as u32;
 
-            self.toc.compression_blocks.push(FIoStoreTocCompressedBlockEntry::new(offset, compressed_size, uncompressed_size, compression_method_index));
+            self.toc.compression_blocks.push(FIoStoreTocCompressedBlockEntry::new(offset, compressed_size, block.len() as u32, compression_method_index));
             offset += compressed_size as u64;
         }
         let hash = hasher.finalize();
