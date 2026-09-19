@@ -773,6 +773,19 @@ fn action_to_legacy_assets(args: &ActionToLegacy, file_writer: &dyn FileWriterTr
     let failed_count = failed_count.load(Ordering::SeqCst);
     info!(log, "Extracted {} ({failed_count} failed) legacy assets to {:?}", count - failed_count, args.output);
 
+    // Individual failures are tolerated on purpose - one unconvertible asset should not
+    // cost the other seventeen thousand. Every asset failing is a different thing: the
+    // conversion did nothing at all and used to say so only in an info line, returning
+    // success. That is how a run against a container without its global.utoc alongside -
+    // where no script import resolves and so every package fails - was taken for a
+    // finished extraction by the wrapper that called it.
+    if count > 0 && failed_count == count {
+        bail!(
+            "every one of the {count} packages failed to convert, nothing was written to {:?}. If the input is a single .utoc, point it at the directory holding it instead: global.utoc has to be alongside, or no script import resolves.",
+            args.output
+        );
+    }
+
     Ok(())
 }
 
