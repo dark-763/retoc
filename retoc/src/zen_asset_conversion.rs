@@ -426,7 +426,19 @@ fn build_zen_export_map(builder: &mut ZenPackageBuilder) -> anyhow::Result<()> {
         let super_index = remap_package_index_reference(builder, object_export.super_index);
         let template_index = remap_package_index_reference(builder, object_export.template_index);
 
-        let gen_hash = (object_export.object_flags & EObjectFlags::Public as u32) != 0 || object_export.generate_public_hash || builder.container_header_version <= EIoContainerHeaderVersion::Initial;
+        // Хеш получают ровно публичные экспорты - так делает кукер. Проверено по
+        // оригинальному контейнеру: из 390 064 экспортов 169 597 имеют и RF_Public,
+        // и хеш, 220 467 не имеют ни того, ни другого, исключений НЕТ ни в одну
+        // сторону.
+        //
+        // Раньше здесь стояло ещё `|| container_header_version <= Initial`, из-за
+        // чего в UE4-контейнерах хеш получал КАЖДЫЙ экспорт - те самые 220 467
+        // лишних значений. Условие было нужно, пока обратное преобразование не
+        // сохраняло признак: `generate_public_hash` в `asset_conversion.rs`
+        // выставляется только начиная с `LocalizedPackages`. Но для версий до
+        // `Initial` он и не нужен - `object_flags` переносятся из zen-экспорта как
+        // есть, и RF_Public переживает круг.
+        let gen_hash = (object_export.object_flags & EObjectFlags::Public as u32) != 0 || object_export.generate_public_hash;
         let (export_package_name, full_export_name) = resolve_legacy_package_object(builder, FPackageIndex::create_export(export_index as u32))?;
 
         // Use global import index converted to the raw representation for legacy packages, and get_public_export_hash otherwise
