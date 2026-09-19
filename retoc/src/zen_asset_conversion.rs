@@ -1644,9 +1644,22 @@ impl ConvertedZenAssetBundle {
         if let Some(package_culture_name) = &self.localized_package_culture_name {
             writer.add_localized_package(package_culture_name, self.source_package_name.as_ref().unwrap(), self.package_id)?;
         }
-        // If this is a redirected package, add the redirect to the redirect map
+        // If this is a redirected package, add the redirect to the redirect map.
+        //
+        // Only when the source name is really someone else's. For container header
+        // versions up to Initial `source_package_name` is filled in for EVERY package,
+        // from its own path, so this used to emit a redirect per package, each one
+        // pointing a package at itself: 17095 entries and about 273 KB of them in the
+        // reference container, where the original cook has none at all. They also made
+        // the header irreproducible, since the list is appended in conversion order and
+        // the conversion is parallel.
+        //
+        // Compared by package id rather than by string, because that is what the engine
+        // resolves a redirect by.
         else if let Some(source_package_name) = &self.source_package_name {
-            writer.add_package_redirect(source_package_name, self.package_id)?;
+            if FPackageId::from_name(source_package_name) != self.package_id {
+                writer.add_package_redirect(source_package_name, self.package_id)?;
+            }
         }
 
         self.package_buffer = Vec::new();
