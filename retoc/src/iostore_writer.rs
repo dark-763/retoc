@@ -101,6 +101,20 @@ impl IoStoreWriter {
     pub fn compression_method(&self) -> Option<CompressionMethod> {
         self.compression_method
     }
+    /// Перенять локализацию и редиректы из заголовка, записанного в дампе.
+    ///
+    /// `pack-raw` наполняет новый заголовок только записями пакетов, а разделы
+    /// локализации и редиректов не восстанавливал ничем - они пропадали молча.
+    /// Возвращает, сколько записей перенесено, чтобы вызывающий мог это показать.
+    pub fn adopt_localization_and_redirects(&mut self, recorded: &FIoContainerHeader) -> (usize, usize) {
+        match self.container_header.as_mut() {
+            Some(header) => {
+                header.adopt_localization_and_redirects(recorded);
+                header.localization_and_redirect_counts()
+            }
+            None => (0, 0),
+        }
+    }
     pub fn write_chunk_raw(&mut self, chunk_id_raw: FIoChunkIdRaw, path: Option<&UEPath>, data: &[u8]) -> Result<()> {
         self.write_chunk(FIoChunkId::from_raw(chunk_id_raw, self.toc.version), path, data)
     }

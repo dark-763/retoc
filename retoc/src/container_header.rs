@@ -17,7 +17,7 @@ use crate::{
     ser::*,
 };
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FIoContainerHeader {
     pub version: EIoContainerHeaderVersion,
     pub container_id: FIoContainerId,
@@ -42,6 +42,45 @@ impl Readable for FIoContainerHeader {
     }
 }
 impl FIoContainerHeader {
+    /// Копия заголовка без самих пакетов - для записи в манифест распакованного
+    /// контейнера.
+    ///
+    /// Записи `StoreEntry` манифест хранит отдельно, по идентификатору чанка, и
+    /// дублировать их тут незачем. А вот остальные разделы - локализованные пакеты,
+    /// редиректы и карта имён под них - в манифесте не представлены ничем, и без
+    /// этой копии круг `unpack-raw` -> `pack-raw` их терял молча.
+    pub fn without_packages(&self) -> Self {
+        let mut copy = self.clone();
+        copy.packages = StoreEntries::default();
+        copy.optional_segment_package_ids = Vec::new();
+        copy.optional_segment_store_entries = Vec::new();
+        copy
+    }
+
+    /// Перенять из записанного заголовка всё, кроме пакетов и идентификатора
+    /// контейнера.
+    ///
+    /// Идентификатор НЕ переносится: он выводится из имени выходного файла и
+    /// принадлежит новому контейнеру, а не тому, из которого снят дамп.
+    pub fn adopt_localization_and_redirects(&mut self, other: &Self) {
+        self.redirect_name_map = other.redirect_name_map.clone();
+        self.localized_packages = other.localized_packages.clone();
+        self.package_redirects = other.package_redirects.clone();
+        self.legacy_culture_package_map = other.legacy_culture_package_map.clone();
+        self.legacy_package_redirects = other.legacy_package_redirects.clone();
+        self.soft_package_references = other.soft_package_references.clone();
+        self.localized_source_package_ids = other.localized_source_package_ids.clone();
+        self.package_redirect_lookup = other.package_redirect_lookup.clone();
+    }
+
+    /// Сколько записей в разделах, которые переносит `adopt_localization_and_redirects`.
+    /// Нужно, чтобы `pack-raw` мог сказать, что именно он восстановил.
+    pub fn localization_and_redirect_counts(&self) -> (usize, usize) {
+        let localized = self.localized_packages.len() + self.legacy_culture_package_map.0.values().map(|v| v.len()).sum::<usize>();
+        let redirects = self.package_redirects.len() + self.legacy_package_redirects.len();
+        (localized, redirects)
+    }
+
     #[instrument(skip_all, name = "FIoContainerHeader")]
     pub fn deserialize<S: Read>(s: &mut S, version_override: Option<EIoContainerHeaderVersion>) -> Result<Self> {
         let signature: u32 = s.de()?;
@@ -299,7 +338,7 @@ impl Writeable for EIoContainerHeaderVersion {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct FIoContainerHeaderLocalizedPackage {
     source_package_id: FPackageId,
     source_package_name: FMappedName,
@@ -321,7 +360,7 @@ impl Writeable for FIoContainerHeaderLocalizedPackage {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct FIoContainerHeaderPackageRedirect {
     source_package_id: FPackageId,
     target_package_id: FPackageId,
@@ -346,7 +385,7 @@ impl Writeable for FIoContainerHeaderPackageRedirect {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct FIoContainerHeaderSoftPackageReferences {
     package_ids: Vec<FPackageId>,
     package_indices: Vec<u8>,
@@ -385,7 +424,7 @@ impl Writeable for FIoContainerHeaderSerialInfo {
 }
 
 // Used for UE4.27 package redirects that do not provide a source package name
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct LegacyContainerHeaderPackageRedirect {
     source_package_id: FPackageId,
     target_package_id: FPackageId,
@@ -418,7 +457,7 @@ pub struct StoreEntry {
     pub shader_map_hashes: Vec<FSHAHash>,
 }
 
-#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 struct StoreEntries(BTreeMap<FPackageId, StoreEntry>);
 impl StoreEntries {
     fn get(&self, package_id: FPackageId) -> Option<StoreEntry> {
@@ -632,7 +671,7 @@ impl FFilePackageStoreEntry {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 struct FCulturePackageMap(BTreeMap<String, Vec<(FPackageId, FPackageId)>>);
 impl Readable for FCulturePackageMap {
     fn de<S: Read>(s: &mut S) -> Result<Self> {

@@ -558,6 +558,15 @@ pub(crate) struct RawIoManifest {
     /// сделанных прежними версиями, его нет, и тогда поведение прежнее.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) compression_method: Option<String>,
+    /// Заголовок исходного контейнера без самих пакетов.
+    ///
+    /// Нужен ради разделов, которых в манифесте нет по отдельности: карта
+    /// локализованных пакетов по культурам и список редиректов. `pack-raw` строит
+    /// заголовок заново и наполняет его только записями пакетов, поэтому без этого
+    /// поля круг `unpack-raw` -> `pack-raw` терял локализацию и редиректы молча.
+    /// Поле необязательное: у дампов прежних версий его нет.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) container_header: Option<retoc::container_header::FIoContainerHeader>,
     pub(crate) package_store_entries: HashMap<ChunkId, retoc::container_header::StoreEntry>,
 }
     #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -602,6 +611,7 @@ fn action_unpack_raw(args: ActionUnpackRaw, config: Arc<Config>) -> Result<()> {
     mount_point: "../../../".to_string(),
     container_header_version: iostore.container_header_version(),
     compression_method: iostore.container_compression_method().map(|m| m.as_ref().to_string()),
+    container_header: iostore.container_header().map(|h| h.without_packages()),
     package_store_entries: Default::default(),
 };
 
@@ -619,6 +629,17 @@ fn action_unpack_raw(args: ActionUnpackRaw, config: Arc<Config>) -> Result<()> {
     let unpacked: Vec<UnpackedChunk> = all_chunks
         .par_iter()
         .map(|chunk| -> Result<UnpackedChunk> {
+            // Собственный заголовок контейнера файлом не выкладываем. Всё его
+            // содержимое манифест хранит и так: записи пакетов - в
+            // `package_store_entries`, остальные разделы - в `container_header`.
+            // Копия рядом была второй истиной об одних и тех же данных, и однажды
+            // это дорого стоило: `pack-raw` переносил её насквозь, в контейнере
+            // оказывалось два заголовка, и движок читал устаревший - снятый с
+            // оригинала, а не построенный нами. Пропуск на стороне `pack-raw`
+            // остался для дампов, сделанных прежними версиями.
+            if chunk.id().get_chunk_type() == EIoChunkType::ContainerHeader {
+                return Ok((chunk.id().get_raw(), None, None));
+            }
             let data = chunk.read()?;
             fs::write(chunks_dir.join(hex::encode(chunk.id().get_raw())), data)?;
 
@@ -642,7 +663,14 @@ fn action_unpack_raw(args: ActionUnpackRaw, config: Arc<Config>) -> Result<()> {
 
     serde_json::to_writer_pretty(BufWriter::new(fs::File::create(manifest_path)?), &manifest)?;
 
-    println!("unpacked {} chunks to {}", chunk_count, output.to_string_lossy());
+    // Число файлов, а не число чанков: заголовок контейнера файлом не выкладывается,
+    // он целиком записан в манифесте.
+    let written = fs::read_dir(&chunks_dir)?.count();
+    if written == chunk_count {
+        println!("unpacked {written} chunks to {}", output.to_string_lossy());
+    } else {
+        println!("unpacked {written} of {chunk_count} chunks to {} (the container header is in manifest.json, not a chunk file)", output.to_string_lossy());
+    }
 
     Ok(())
 }
@@ -661,6 +689,12 @@ fn action_pack_raw(args: ActionPackRaw, _config: Arc<Config>) -> Result<()> {
             .with_context(|| format!("manifest names an unknown compression method: {name}")))
         .transpose()?;
     writer.use_compression_method_if_unset(recorded);
+    if let Some(recorded_header) = &manifest.container_header {
+        let (localized, redirects) = writer.adopt_localization_and_redirects(recorded_header);
+        if localized != 0 || redirects != 0 {
+            println!("restored {localized} localized package entries and {redirects} package redirects");
+        }
+    }
     match (writer.compression_method(), recorded) {
         (Some(used), Some(rec)) if used != rec => println!("compressing with {used:?} (manifest recorded {rec:?})"),
         (Some(used), _) => println!("compressing with {used:?}"),

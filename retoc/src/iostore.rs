@@ -103,6 +103,9 @@ pub trait IoStoreTrait: Send + Sync {
     fn chunk_path(&self, chunk_id: FIoChunkId) -> Option<String>;
     fn package_store_entry(&self, package_id: FPackageId) -> Option<StoreEntry>;
     fn lookup_package_redirect(&self, source_package_id: FPackageId) -> Option<FPackageId>;
+    /// Заголовок контейнера целиком. Нужен `unpack-raw`, чтобы записать в манифест
+    /// разделы, которых там нет по отдельности: локализацию и редиректы.
+    fn container_header(&self) -> Option<&FIoContainerHeader>;
 
     fn load_script_objects(&self) -> Result<ZenScriptObjects> {
         if self.container_file_version().unwrap() > EIoStoreTocVersion::PerfectHash {
@@ -307,6 +310,9 @@ impl IoStoreTrait for IoStoreBackend {
     fn package_store_entry(&self, package_id: FPackageId) -> Option<StoreEntry> {
         self.containers.iter().find_map(|c| c.package_store_entry(package_id))
     }
+    fn container_header(&self) -> Option<&FIoContainerHeader> {
+        self.containers.first().and_then(|c| c.container_header())
+    }
     fn lookup_package_redirect(&self, source_package_id: FPackageId) -> Option<FPackageId> {
         self.containers.iter().find_map(|c| c.lookup_package_redirect(source_package_id))
     }
@@ -430,6 +436,9 @@ impl IoStoreTrait for IoStoreContainer {
     }
     fn package_store_entry(&self, package_id: FPackageId) -> Option<StoreEntry> {
         self.container_header.as_ref().and_then(|header| header.get_store_entry(package_id))
+    }
+    fn container_header(&self) -> Option<&FIoContainerHeader> {
+        self.container_header.as_ref()
     }
     fn lookup_package_redirect(&self, source_package_id: FPackageId) -> Option<FPackageId> {
         self.container_header.as_ref().and_then(|header| header.lookup_package_redirect(source_package_id))
