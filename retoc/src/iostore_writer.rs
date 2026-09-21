@@ -84,6 +84,23 @@ impl IoStoreWriter {
             compression_method,
         })
     }
+    /// Взять метод сжатия из распакованного дампа, если переменная окружения не задана.
+    ///
+    /// Явное указание пользователя главнее записанного в дампе, поэтому переменная
+    /// перекрывает. Вызывать до записи первого чанка: дальше метод уже участвует в
+    /// сжатии и в таблице методов контейнера.
+    pub fn use_compression_method_if_unset(&mut self, method: Option<CompressionMethod>) {
+        if self.compression_method.is_some() {
+            return;
+        }
+        if let Some(method) = method {
+            self.compression_method = Some(method);
+            self.toc.compression_methods = vec![method];
+        }
+    }
+    pub fn compression_method(&self) -> Option<CompressionMethod> {
+        self.compression_method
+    }
     pub fn write_chunk_raw(&mut self, chunk_id_raw: FIoChunkIdRaw, path: Option<&UEPath>, data: &[u8]) -> Result<()> {
         self.write_chunk(FIoChunkId::from_raw(chunk_id_raw, self.toc.version), path, data)
     }

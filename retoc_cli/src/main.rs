@@ -4,6 +4,7 @@ use clap::Parser;
 use fs_err as fs;
 use rayon::prelude::*;
 use retoc::asset_conversion::{self, FZenPackageContext};
+use retoc::compression::CompressionMethod;
 use retoc::container_header::{EIoContainerHeaderVersion, StoreEntry};
 use retoc::iostore::{IoStoreTrait, PackageInfo};
 use retoc::iostore_writer::IoStoreWriter;
@@ -549,6 +550,14 @@ pub(crate) struct RawIoManifest {
     pub(crate) version: EIoStoreTocVersion,
     pub(crate) mount_point: String,
     pub(crate) container_header_version: Option<retoc::container_header::EIoContainerHeaderVersion>,
+    /// Метод сжатия исходного контейнера, именем ("Zlib", "Zstd", ...).
+    ///
+    /// Без него `pack-raw` брал метод только из переменной окружения, и распаковка
+    /// сжатого контейнера с последующей упаковкой без переменной молча давала
+    /// несжатый контейнер вдвое большего размера. Поле необязательное: у дампов,
+    /// сделанных прежними версиями, его нет, и тогда поведение прежнее.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compression_method: Option<String>,
     pub(crate) package_store_entries: HashMap<ChunkId, retoc::container_header::StoreEntry>,
 }
     #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -592,6 +601,7 @@ fn action_unpack_raw(args: ActionUnpackRaw, config: Arc<Config>) -> Result<()> {
     version: iostore.container_file_version().unwrap(),
     mount_point: "../../../".to_string(),
     container_header_version: iostore.container_header_version(),
+    compression_method: iostore.container_compression_method().map(|m| m.as_ref().to_string()),
     package_store_entries: Default::default(),
 };
 
@@ -641,6 +651,21 @@ fn action_pack_raw(args: ActionPackRaw, _config: Arc<Config>) -> Result<()> {
     let manifest: raw::RawIoManifest = serde_json::from_reader(BufReader::new(fs::File::open(args.input.join("manifest.json"))?))?;
 
     let mut writer = IoStoreWriter::new(args.utoc, manifest.version, manifest.container_header_version, manifest.mount_point.into())?;
+
+    // Метод сжатия из манифеста, если RETOC_COMPRESSION не задана. Иначе распаковка
+    // сжатого контейнера и упаковка обратно молча давали несжатый вдвое больший.
+    let recorded = manifest
+        .compression_method
+        .as_deref()
+        .map(|name| CompressionMethod::from_str_ignore_case(name)
+            .with_context(|| format!("manifest names an unknown compression method: {name}")))
+        .transpose()?;
+    writer.use_compression_method_if_unset(recorded);
+    match (writer.compression_method(), recorded) {
+        (Some(used), Some(rec)) if used != rec => println!("compressing with {used:?} (manifest recorded {rec:?})"),
+        (Some(used), _) => println!("compressing with {used:?}"),
+        (None, _) => println!("writing uncompressed"),
+    }
     for entry in args.input.join("chunks").read_dir()? {
         let entry = entry?;
         let chunk_id = FIoChunkIdRaw::from_str(entry.file_name().to_string_lossy().as_ref())?;

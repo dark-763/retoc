@@ -12,6 +12,7 @@ use fs_err as fs;
 use crate::{
     Config, EIoChunkType, EIoStoreTocVersion, FIoChunkHash, FIoChunkId, FPackageId, Toc,
     chunk_id::FIoChunkIdRaw,
+    compression::CompressionMethod,
     container_header::{EIoContainerHeaderVersion, FIoContainerHeader, StoreEntry},
     file_pool::FilePool,
     script_objects::ZenScriptObjects,
@@ -84,6 +85,9 @@ pub trait IoStoreTrait: Send + Sync {
     fn container_name(&self) -> &str;
     fn container_file_version(&self) -> Option<EIoStoreTocVersion>;
     fn container_header_version(&self) -> Option<EIoContainerHeaderVersion>;
+    /// Compression method the container's chunks are stored with, if any. retoc's
+    /// writer only ever uses one, so the first one is the whole answer.
+    fn container_compression_method(&self) -> Option<CompressionMethod>;
     fn print_info(&self, depth: usize);
 
     fn read(&self, chunk_id: FIoChunkId) -> Result<Vec<u8>>;
@@ -249,6 +253,9 @@ impl IoStoreTrait for IoStoreBackend {
     fn container_file_version(&self) -> Option<EIoStoreTocVersion> {
         self.containers.first().and_then(|x| x.container_file_version())
     }
+    fn container_compression_method(&self) -> Option<CompressionMethod> {
+        self.containers.first().and_then(|x| x.container_compression_method())
+    }
     fn container_header_version(&self) -> Option<EIoContainerHeaderVersion> {
         // Some containers might not have a container header, so take the first container with a header
         self.containers.iter().find_map(|x| x.container_header_version())
@@ -358,6 +365,9 @@ impl IoStoreTrait for IoStoreContainer {
     }
     fn container_file_version(&self) -> Option<EIoStoreTocVersion> {
         Some(self.toc.version)
+    }
+    fn container_compression_method(&self) -> Option<CompressionMethod> {
+        self.toc.compression_methods.first().copied()
     }
     fn container_header_version(&self) -> Option<EIoContainerHeaderVersion> {
         self.container_header.as_ref().map(|x| x.version)
