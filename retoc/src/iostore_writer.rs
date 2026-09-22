@@ -226,6 +226,33 @@ mod test {
     use super::*;
     use fs_err as fs;
 
+    /// Чанк нулевой длины, записанный первым, раньше делал контейнер нечитаемым:
+    /// расчёт диапазона блоков уходил в минус по u64 и любое чтение падало на
+    /// выходе за границы среза. Второй чанк здесь - чтобы проверить, что за
+    /// пустым чанком данные по-прежнему читаются правильно.
+    #[test]
+    fn a_zero_length_chunk_first_does_not_break_the_container() -> Result<()> {
+        use crate::{Config, iostore::IoStoreContainer, iostore::IoStoreTrait};
+        use std::sync::Arc;
+
+        let out = std::env::temp_dir().join("retoc-test-zero-length-chunk");
+        fs::create_dir_all(&out)?;
+        let toc_path = out.join("zero.utoc");
+
+        let empty_id = FIoChunkIdRaw { id: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2] };
+        let filled_id = FIoChunkIdRaw { id: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2] };
+
+        let mut writer = IoStoreWriter::new(&toc_path, EIoStoreTocVersion::DirectoryIndex, None, "../../../".into())?;
+        writer.write_chunk_raw(empty_id, None, &[])?;
+        writer.write_chunk_raw(filled_id, None, b"hello")?;
+        writer.finalize()?;
+
+        let container = IoStoreContainer::open(&toc_path, Arc::new(Config::default()))?;
+        assert_eq!(container.read_raw(empty_id)?, Vec::<u8>::new());
+        assert_eq!(container.read_raw(filled_id)?, b"hello".to_vec());
+        Ok(())
+    }
+
     #[test]
     fn test_write_container() -> Result<()> {
         // Во временный каталог, а не в "out" рядом с репозиторием: иначе после

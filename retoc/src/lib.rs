@@ -585,6 +585,27 @@ impl Toc {
             .and_then(|index| self.file_map_rev.get(index))
             .map(|path| UEPath::new(&self.directory_index.mount_point).join(path).to_string())
     }
+    /// Диапазон блоков сжатия, в которых лежит чанк.
+    ///
+    /// Чанк нулевой длины не занимает ни одного блока, и диапазон для него пуст.
+    /// Прежняя формула этот случай не разбирала: она вычитала единицу из
+    /// выровненного конца, а при нулевой длине выровненный конец равен началу.
+    /// Для чанка в самом начале контейнера это уход в минус по u64 - индекс
+    /// последнего блока получался 281474976710655, и чтение падало на выходе за
+    /// границы среза, то есть контейнер целиком становился нечитаемым.
+    ///
+    /// Нулевой чанк - не выдумка: `to-zen` пишет чанк для `.ubulk`, если файл
+    /// ПРИСУТСТВУЕТ, а не если он непустой, и пустой `.ubulk` даёт ровно такой
+    /// чанк. Попадёт он первым или нет, решает порядок завершения задач.
+    fn chunk_block_range(&self, offset: u64, size: u64) -> std::ops::Range<usize> {
+        if size == 0 {
+            return 0..0;
+        }
+        let block_size = self.compression_block_size as u64;
+        let first_block_index = (offset / block_size) as usize;
+        let last_block_index = ((align_u64(offset + size, block_size) - 1) / block_size) as usize;
+        first_block_index..last_block_index + 1
+    }
     #[allow(unused)]
     pub fn get_chunk_info(&self, file_name: &str) -> FIoStoreTocChunkInfo {
         let toc_entry_index = self.file_map[file_name] as usize;
@@ -598,16 +619,14 @@ impl Toc {
         let offset = offset_and_length.get_offset();
         let size = offset_and_length.get_length();
 
-        let compression_block_size = self.compression_block_size;
-        let first_block_index = (offset / compression_block_size as u64) as usize;
-        let last_block_index = ((align_u64(offset + size, compression_block_size as u64) - 1) / compression_block_size as u64) as usize;
+        let block_range = self.chunk_block_range(offset, size);
 
-        let num_compressed_blocks = (1 + last_block_index - first_block_index) as u32;
-        let offset_on_disk = self.compression_blocks[first_block_index].get_offset();
+        let num_compressed_blocks = block_range.len() as u32;
+        let offset_on_disk = self.compression_blocks.get(block_range.start).map(|block| block.get_offset()).unwrap_or(0);
         let mut compressed_size = 0;
         let mut partition_index = -1;
 
-        for block_index in first_block_index..=last_block_index {
+        for block_index in block_range {
             let compression_block = &self.compression_blocks[block_index];
             compressed_size += compression_block.get_compressed_size() as u64;
             if partition_index < 0 {
@@ -643,11 +662,7 @@ impl Toc {
         let offset = offset_and_length.get_offset();
         let size = offset_and_length.get_length();
 
-        let compression_block_size = self.compression_block_size;
-        let first_block_index = (offset / compression_block_size as u64) as usize;
-        let last_block_index = ((align_u64(offset + size, compression_block_size as u64) - 1) / compression_block_size as u64) as usize;
-
-        let blocks = &self.compression_blocks[first_block_index..=last_block_index];
+        let blocks = &self.compression_blocks[self.chunk_block_range(offset, size)];
         let aes_key = if self.container_flags.contains(EIoContainerFlags::Encrypted) {
             Some(self.config.aes_keys.get(&self.encryption_key_guid).with_context(|| format!("container is encrypted but no AES key for {:?} supplied", self.encryption_key_guid))?)
         } else {
