@@ -598,6 +598,20 @@ pub(crate) struct RawIoManifest {
 fn action_unpack_raw(args: ActionUnpackRaw, config: Arc<Config>) -> Result<()> {
     let iostore = iostore::open(args.utoc, config)?;
 
+    // Дамп несёт ровно один заголовок контейнера, и `pack-raw` собирает из него ровно
+    // один контейнер. Если в каталоге несколько контейнеров с заголовками, выбрать из
+    // них один - значит молча потерять записи пакетов, локализацию и редиректы всех
+    // остальных. Один .utoc (и global.utoc рядом, заголовка у него нет) под это не
+    // попадает: там заголовок один.
+    let containers_with_header: Vec<String> = iostore.child_containers().filter(|c| c.container_header().is_some()).map(|c| c.container_name().to_string()).collect();
+    if containers_with_header.len() > 1 {
+        bail!(
+            "{} containers here carry a package header ({}). A raw dump holds one container header and `pack-raw` writes one container, so packing this back would silently drop all but one. Point unpack-raw at a single .utoc instead.",
+            containers_with_header.len(),
+            containers_with_header.join(", ")
+        );
+    }
+
     let output = args.output;
     let chunks_dir = output.join("chunks");
     let manifest_path = output.join("manifest.json");

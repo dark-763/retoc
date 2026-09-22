@@ -257,7 +257,13 @@ impl IoStoreTrait for IoStoreBackend {
         self.containers.first().and_then(|x| x.container_file_version())
     }
     fn container_compression_method(&self) -> Option<CompressionMethod> {
-        self.containers.first().and_then(|x| x.container_compression_method())
+        // Первый контейнер, у которого метод есть, а не просто первый: сортировка
+        // ставит global строго первым (это её задокументированное свойство и
+        // отдельный тест ниже), а global не сжат и заголовка не имеет. Через
+        // `.first()` каталог с игровым контейнером внутри отвечал "сжатия нет" и
+        // "заголовка нет" - `unpack-raw` записывал это в манифест, и `pack-raw`
+        // молча отдавал несжатый контейнер без локализации и редиректов.
+        self.containers.iter().find_map(|x| x.container_compression_method())
     }
     fn container_header_version(&self) -> Option<EIoContainerHeaderVersion> {
         // Some containers might not have a container header, so take the first container with a header
@@ -311,7 +317,9 @@ impl IoStoreTrait for IoStoreBackend {
         self.containers.iter().find_map(|c| c.package_store_entry(package_id))
     }
     fn container_header(&self) -> Option<&FIoContainerHeader> {
-        self.containers.first().and_then(|c| c.container_header())
+        // Тот же разбор, что и у `container_compression_method`: первый заголовок,
+        // который вообще есть, а не заголовок первого контейнера.
+        self.containers.iter().find_map(|c| c.container_header())
     }
     fn lookup_package_redirect(&self, source_package_id: FPackageId) -> Option<FPackageId> {
         self.containers.iter().find_map(|c| c.lookup_package_redirect(source_package_id))
@@ -485,6 +493,39 @@ mod test {
         };
         let message = format!("{err:#}");
         assert!(message.contains("failed to parse the container header"), "unexpected error: {message}");
+        Ok(())
+    }
+
+    /// В каталоге global идёт первым по сортировке, но сжатия и заголовка у него нет.
+    /// Свойства каталога должны браться у того контейнера, у которого они есть.
+    #[test]
+    fn directory_takes_compression_and_header_from_the_container_that_has_them() -> Result<()> {
+        use crate::compression::CompressionMethod;
+        use crate::container_header::EIoContainerHeaderVersion;
+        use crate::iostore_writer::IoStoreWriter;
+        use crate::{EIoStoreTocVersion, FIoChunkIdRaw};
+        use fs_err as fs;
+
+        let dir = std::env::temp_dir().join("retoc-test-directory-backend");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+
+        // global: ни сжатия, ни заголовка - ровно как в игре.
+        let mut global = IoStoreWriter::new(dir.join("global.utoc"), EIoStoreTocVersion::DirectoryIndex, None, "../../../".into())?;
+        global.write_chunk_raw(FIoChunkIdRaw { id: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8] }, None, b"global names")?;
+        global.finalize()?;
+
+        // Игровой контейнер: сжат и с заголовком.
+        let mut game = IoStoreWriter::new(dir.join("pakchunk0-Windows.utoc"), EIoStoreTocVersion::DirectoryIndex, Some(EIoContainerHeaderVersion::Initial), "../../../".into())?;
+        game.use_compression_method_if_unset(Some(CompressionMethod::Zlib));
+        game.write_chunk_raw(FIoChunkIdRaw { id: [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2] }, None, b"package data")?;
+        game.finalize()?;
+
+        let backend = open(&dir, Arc::new(Config::default()))?;
+        // Порядок именно тот, из-за которого правка и понадобилась.
+        assert_eq!(backend.child_containers().map(|c| c.container_name().to_string()).collect::<Vec<_>>(), ["global", "pakchunk0-Windows"]);
+        assert_eq!(backend.container_compression_method(), Some(CompressionMethod::Zlib));
+        assert!(backend.container_header().is_some(), "the directory reported no container header");
         Ok(())
     }
 
