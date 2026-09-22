@@ -202,6 +202,15 @@ impl IoStoreBackend {
                 containers.push(Box::new(IoStoreContainer::open(path, config.clone())?));
             }
         }
+        // Каталог без единого .utoc - это ошибка, а не пустой набор контейнеров.
+        // Раньше он давал объект, у которого нет ни версии, ни заголовка, и вызывающие
+        // разбивались об `.unwrap()` где-то ниже: `unpack-raw` падал с
+        // "called `Option::unwrap()` on a `None` value", успев создать половину
+        // выходного каталога.
+        if containers.is_empty() {
+            bail!("no .utoc file in {:?}. Point retoc at the directory that holds the containers, or at a single .utoc.", dir.as_ref());
+        }
+
         // Validate that all containers are of the same version
         let mut previous_container_version: Option<EIoStoreTocVersion> = None;
         let mut previous_container_name: String = String::new();

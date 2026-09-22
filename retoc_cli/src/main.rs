@@ -331,8 +331,8 @@ fn action_manifest(args: ActionManifest, config: Arc<Config>) -> Result<()> {
 
     let entries = Arc::new(Mutex::new(vec![]));
 
-    let container_header_version = iostore.container_header_version().unwrap();
-    let toc_version = iostore.container_file_version().unwrap();
+    let container_header_version = iostore.container_header_version().context("this input has no container header, so it lists no packages and there is no manifest to write")?;
+    let toc_version = iostore.container_file_version().context("this input has no container")?;
 
     iostore.packages().par_bridge().try_for_each(|package_info| -> Result<()> {
         let chunk_id = FIoChunkId::from_package_id(package_info.id(), 0, EIoChunkType::ExportBundleData).with_version(toc_version);
@@ -621,7 +621,7 @@ fn action_unpack_raw(args: ActionUnpackRaw, config: Arc<Config>) -> Result<()> {
 
    let mut manifest = raw::RawIoManifest {
     chunk_paths: Default::default(),
-    version: iostore.container_file_version().unwrap(),
+    version: iostore.container_file_version().context("this input has no container")?,
     mount_point: "../../../".to_string(),
     container_header_version: iostore.container_header_version(),
     compression_method: iostore.container_compression_method().map(|m| m.as_ref().to_string()),
@@ -734,14 +734,17 @@ fn action_pack_raw(args: ActionPackRaw, _config: Arc<Config>) -> Result<()> {
         // pack-raw -> unpack-raw round trip, for as long as this stale copy was
         // present in the input directory; removing it from the input fixed it. Skip
         // it here so only the freshly-built header ever exists in the output.
-        if FIoChunkId::from_raw(chunk_id, writer.container_version()).get_chunk_type() == EIoChunkType::ContainerHeader {
+        // Имя файла чанка - это то, что лежит в каталоге, то есть вход без гарантий:
+        // байт типа в нём может быть любым, а `from_raw` на неизвестном паникует.
+        let full_chunk_id = FIoChunkId::try_from_raw(chunk_id, writer.container_version())
+            .with_context(|| format!("chunk file {:?} does not name a chunk of this container's version", entry.file_name()))?;
+        if full_chunk_id.get_chunk_type() == EIoChunkType::ContainerHeader {
             continue;
         }
 
         let path = manifest.chunk_paths.get(&chunk_id_key).map(UEPath::new);
         let data = fs::read(entry.path())?;
         if let Some(store_entry) = manifest.package_store_entries.get(&chunk_id_key) {
-            let full_chunk_id = FIoChunkId::from_raw(chunk_id, writer.container_version());
             writer.write_package_chunk(full_chunk_id, path, &data, store_entry)?;
         } else {
             writer.write_chunk_raw(chunk_id, path, &data)?;
@@ -1195,8 +1198,8 @@ fn action_dump_test(args: ActionDumpTest, config: Arc<Config>) -> Result<()> {
     let store_entry = iostore.package_store_entry(args.package_id).unwrap();
 
     let metadata = PackageTestMetadata {
-        toc_version: iostore.container_file_version().unwrap(),
-        container_header_version: iostore.container_header_version().unwrap(),
+        toc_version: iostore.container_file_version().context("this input has no container")?,
+        container_header_version: iostore.container_header_version().context("this input has no container header")?,
         package_file_version: None,
         store_entry: Some(store_entry),
     };

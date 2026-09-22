@@ -876,7 +876,7 @@ mod chunk_id {
     impl ReadableCtx<EIoStoreTocVersion> for FIoChunkId {
         fn de<S: Read>(s: &mut S, version: EIoStoreTocVersion) -> Result<Self> {
             let raw: FIoChunkIdRaw = s.de()?;
-            Ok(Self::from_raw(raw, version))
+            Self::try_from_raw(raw, version)
         }
     }
     impl Writeable for FIoChunkId {
@@ -886,12 +886,19 @@ mod chunk_id {
     }
     impl FIoChunkId {
         pub fn from_raw(raw: FIoChunkIdRaw, version: EIoStoreTocVersion) -> Self {
+            Self::try_from_raw(raw, version).unwrap()
+        }
+        /// То же, что `from_raw`, но сообщением, а не паникой.
+        ///
+        /// Байт типа приходит либо из файла контейнера, либо из имени файла чанка в
+        /// сыром дампе - и то и другое может содержать что угодно.
+        pub fn try_from_raw(raw: FIoChunkIdRaw, version: EIoStoreTocVersion) -> Result<Self> {
             let mut id: [u8; 12] = raw.id;
             let is_new = version > EIoStoreTocVersion::PerfectHash;
-            id[11] = EIoChunkType::new(id[11], is_new) as u8;
+            id[11] = EIoChunkType::try_new(id[11], is_new).with_context(|| format!("chunk id {}", hex::encode(raw.id)))? as u8;
             id[11] |= (is_new as u8) << 7; // set bit to is_new
             id[11] |= 1 << 6; // set bit to indicate has version
-            Self { id }
+            Ok(Self { id })
         }
         pub fn with_version(self, version: EIoStoreTocVersion) -> Self {
             let mut id: [u8; 12] = self.id;
@@ -1289,9 +1296,17 @@ pub enum EIoChunkType {
 }
 impl EIoChunkType {
     pub fn new(value: u8, is_new: bool) -> Self {
+        Self::try_new(value, is_new).unwrap()
+    }
+    /// Тип чанка по байту из контейнера.
+    ///
+    /// Байт приходит из файла, то есть может быть каким угодно, а `new` на неизвестном
+    /// значении паникует. Разбор идентификаторов чанков идёт через эту версию: при
+    /// открытии контейнера чужой версии на месте паники должно быть сообщение.
+    pub fn try_new(value: u8, is_new: bool) -> Result<Self> {
         use EIoChunkType::*;
         if is_new {
-            match value {
+            Ok(match value {
                 0 => Invalid,
                 1 => ExportBundleData,
                 2 => BulkData,
@@ -1306,10 +1321,10 @@ impl EIoChunkType {
                 11 => DerivedData,
                 12 => EditorDerivedData,
                 13 => PackageResource,
-                _ => panic!("invalid chunk type for version >= UE5: {value}"),
-            }
+                _ => bail!("invalid chunk type for version >= UE5: {value}"),
+            })
         } else {
-            match value {
+            Ok(match value {
                 0 => Invalid,
                 1 => InstallManifest,
                 2 => ExportBundleData,
@@ -1323,8 +1338,8 @@ impl EIoChunkType {
                 10 => ContainerHeader,
                 11 => ShaderCodeLibrary,
                 12 => ShaderCode,
-                _ => panic!("invalid chunk type for version < UE5: {value}"),
-            }
+                _ => bail!("invalid chunk type for version < UE5: {value}"),
+            })
         }
     }
     pub fn value(self, is_new: bool) -> u8 {
