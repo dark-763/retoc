@@ -783,6 +783,22 @@ mod test {
         let _chunk_id = FIoChunkId::from_package_id(package_id, 0, EIoChunkType::ExportBundleData);
         // dbg!(chunk_id);
     }
+
+    /// До UE 5.5 в мете чанка лежит SHA-1, дальше - blake3. Векторы известные, на "abc".
+    #[test]
+    fn chunk_hash_follows_the_container_version() {
+        let sha1_of_abc = "a9993e364706816aba3e25717850c26c9cd0d89d";
+        let blake3_of_abc = "6437b3ac38465133ffb63b75273a8db548c55846";
+
+        for version in [EIoStoreTocVersion::DirectoryIndex, EIoStoreTocVersion::PerfectHash, EIoStoreTocVersion::PerfectHashWithOverflow] {
+            let hash = hash_chunk(version, b"abc");
+            assert_eq!(hex::encode(&hash.0[..20]), sha1_of_abc, "{version:?} should hash with SHA-1");
+            assert_eq!(&hash.0[20..], &[0u8; 12], "{version:?} should pad the hash with zeroes");
+        }
+
+        let hash = hash_chunk(EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash, b"abc");
+        assert_eq!(hex::encode(&hash.0[..20]), blake3_of_abc);
+    }
 }
 
 pub use chunk_id::{FIoChunkId, FIoChunkIdRaw};
@@ -1071,6 +1087,36 @@ impl FIoChunkHash {
         let mut data = [0; 32];
         data[0..20].copy_from_slice(&hash[0..20]);
         Self(data)
+    }
+    pub fn from_sha1(hash: &[u8; 20]) -> FIoChunkHash {
+        let mut data = [0; 32];
+        data[0..20].copy_from_slice(hash);
+        Self(data)
+    }
+}
+
+/// Хеш содержимого чанка - тот, который для этой версии контейнера считает движок.
+///
+/// До UE 5.5 в мете чанка лежит `FIoChunkHash`: 20 байт SHA-1, дополненных нулями до
+/// 32. С UE 5.5 (`ReplaceIoChunkHashWithIoHash`) на его месте `FIoHash`, то есть 20
+/// байт blake3 - отсюда и имя версии.
+///
+/// Писалось всегда blake3, при любой версии. Проверено на контейнере игры 4.26:
+/// у чанка `d976b721e37dafca00000002` в TOC лежит `a1608a85...`, и это ровно SHA-1 его
+/// данных, а retoc записывал на то же место `1dec0d58...`. Поэтому `retoc verify` на
+/// любом настоящем контейнере 4.26 сообщал расхождение на самом первом чанке, а всё,
+/// что retoc собирал для 4.26, несло хеши не той функции.
+///
+/// Граница взята по типу самого поля: пока это `FIoChunkHash` - SHA-1, дальше blake3.
+/// Измерено на 4.26; для 5.0-5.4 контейнера под рукой нет, но поле там то же самое.
+pub fn hash_chunk(version: EIoStoreTocVersion, data: &[u8]) -> FIoChunkHash {
+    if version >= EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash {
+        FIoChunkHash::from_blake3(blake3::hash(data).as_bytes())
+    } else {
+        use sha1::Digest;
+        let mut hasher = sha1::Sha1::new();
+        hasher.update(data);
+        FIoChunkHash::from_sha1(&hasher.finalize().into())
     }
 }
 impl std::fmt::Debug for FIoChunkHash {

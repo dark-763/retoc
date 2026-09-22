@@ -497,7 +497,10 @@ fn action_verify(args: ActionVerify, config: Arc<Config>) -> Result<()> {
             //    _ => {} // TODO
             //}
 
-            let hash = blake3::hash(&data);
+            // Функция хеширования зависит от версии контейнера: до UE 5.5 SHA-1,
+            // дальше blake3. Здесь всегда считался blake3, поэтому `verify` на
+            // настоящем контейнере 4.26 падал на чанке #0.
+            let hash = retoc::hash_chunk(toc.version, &data);
 
             //println!(
             //    "{:>10} {:?} {} {:?}",
@@ -507,8 +510,8 @@ fn action_verify(args: ActionVerify, config: Arc<Config>) -> Result<()> {
             //    meta.flags
             //);
 
-            if meta.chunk_hash.0[..20] != hash.as_bytes()[..20] {
-                bail!("hash mismatch for chunk #{i}")
+            if meta.chunk_hash.0[..20] != hash.0[..20] {
+                bail!("hash mismatch for chunk #{i}: the toc says {}, the data hashes to {}", hex::encode(&meta.chunk_hash.0[..20]), hex::encode(&hash.0[..20]))
             }
 
             Ok(())

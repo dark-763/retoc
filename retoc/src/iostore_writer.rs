@@ -3,7 +3,7 @@ use crate::{
     chunk_id::FIoChunkIdRaw,
     container_header::{EIoContainerHeaderVersion, FIoContainerHeader, StoreEntry},
 };
-use crate::{EIoStoreTocVersion, FIoChunkHash, FIoChunkId, FIoContainerId, FIoOffsetAndLength, FIoStoreTocCompressedBlockEntry, FIoStoreTocEntryMeta, FIoStoreTocEntryMetaFlags, Toc, ser::*};
+use crate::{EIoStoreTocVersion, FIoChunkId, FIoContainerId, FIoOffsetAndLength, FIoStoreTocCompressedBlockEntry, FIoStoreTocEntryMeta, FIoStoreTocEntryMetaFlags, Toc, ser::*};
 use crate::compression::{CompressionMethod, compress};
 use anyhow::{Context, Result};
 use fs_err as fs;
@@ -129,11 +129,9 @@ impl IoStoreWriter {
 
         let start_block = self.toc.compression_blocks.len();
 
-        // Хеш считается по несжатым данным - так же, как в оригинале. Блоки идут
-        // подряд и вместе составляют `data`, поэтому обновление по блокам и одно
-        // обновление целиком дают один и тот же хеш.
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(data);
+        // Хеш считается по несжатым данным - так же, как в оригинале. Функция зависит
+        // от версии контейнера: до UE 5.5 это SHA-1, дальше blake3.
+        let chunk_hash = crate::hash_chunk(self.toc.version, data);
 
         let block_size = self.toc.compression_block_size as usize;
         let method = self.compression_method;
@@ -174,7 +172,6 @@ impl IoStoreWriter {
             self.toc.compression_blocks.push(FIoStoreTocCompressedBlockEntry::new(offset, compressed_size, block.len() as u32, compression_method_index));
             offset += compressed_size as u64;
         }
-        let hash = hasher.finalize();
         // Флаг всегда был пуст, то есть каждый чанк сжатого контейнера утверждал, что он
         // не сжат. У оригинала игры флаг стоит на 19778 чанках из 19779. Ставим его по
         // факту: хотя бы один блок чанка записан сжатым. Это не дословно кукерское
@@ -186,10 +183,7 @@ impl IoStoreWriter {
         if any_block_compressed {
             flags |= FIoStoreTocEntryMetaFlags::Compressed;
         }
-        let meta = FIoStoreTocEntryMeta {
-            chunk_hash: FIoChunkHash::from_blake3(hash.as_bytes()),
-            flags,
-        };
+        let meta = FIoStoreTocEntryMeta { chunk_hash, flags };
 
         let offset_and_length = FIoOffsetAndLength::new(start_block as u64 * self.toc.compression_block_size as u64, data.len() as u64);
 
