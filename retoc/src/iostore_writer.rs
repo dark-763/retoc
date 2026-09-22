@@ -161,9 +161,11 @@ impl IoStoreWriter {
             None => Vec::new(),
         };
 
+        let mut any_block_compressed = false;
         for (index, block) in data.chunks(block_size).enumerate() {
             let squeezed = compressed.get(index).and_then(|x| x.as_deref());
             let compression_method_index = if squeezed.is_some() { 1u8 } else { 0u8 };
+            any_block_compressed |= squeezed.is_some();
             let payload: &[u8] = squeezed.unwrap_or(block);
 
             self.cas_stream.write_all(payload)?;
@@ -173,9 +175,20 @@ impl IoStoreWriter {
             offset += compressed_size as u64;
         }
         let hash = hasher.finalize();
+        // Флаг всегда был пуст, то есть каждый чанк сжатого контейнера утверждал, что он
+        // не сжат. У оригинала игры флаг стоит на 19778 чанках из 19779. Ставим его по
+        // факту: хотя бы один блок чанка записан сжатым. Это не дословно кукерское
+        // правило - кукер ставит флаг всем чанкам, которые ОТДАЛ на сжатие, независимо
+        // от того, выиграло ли оно хоть на одном блоке, - но это правило самосогласовано
+        // и проверяемо по самому контейнеру, а кукерское по контейнеру не восстановить:
+        // какие чанки он из сжатия исключил, нигде не записано.
+        let mut flags = FIoStoreTocEntryMetaFlags::empty();
+        if any_block_compressed {
+            flags |= FIoStoreTocEntryMetaFlags::Compressed;
+        }
         let meta = FIoStoreTocEntryMeta {
             chunk_hash: FIoChunkHash::from_blake3(hash.as_bytes()),
-            flags: FIoStoreTocEntryMetaFlags::empty(),
+            flags,
         };
 
         let offset_and_length = FIoOffsetAndLength::new(start_block as u64 * self.toc.compression_block_size as u64, data.len() as u64);
@@ -250,6 +263,56 @@ mod test {
         let container = IoStoreContainer::open(&toc_path, Arc::new(Config::default()))?;
         assert_eq!(container.read_raw(empty_id)?, Vec::<u8>::new());
         assert_eq!(container.read_raw(filled_id)?, b"hello".to_vec());
+        Ok(())
+    }
+
+    /// Сжатый контейнер обязан говорить о себе, что он сжат: и флагом контейнера, и
+    /// флагом каждого чанка, чьи блоки действительно ужались. Раньше оба были пусты.
+    #[test]
+    fn a_compressed_container_says_so_in_its_flags() -> Result<()> {
+        use crate::compression::CompressionMethod;
+        use crate::{Config, EIoContainerFlags};
+        use std::io::BufReader;
+        use std::sync::Arc;
+
+        let out = std::env::temp_dir().join("retoc-test-compression-flags");
+        fs::create_dir_all(&out)?;
+
+        let squeezable = vec![b'a'; 200_000];
+        // Несжимаемое: младший байт линейного конгруэнтного генератора. zlib на таком
+        // проигрывает, блок пишется как есть, и флага у чанка быть не должно.
+        let mut state: u32 = 12345;
+        let noise: Vec<u8> = (0..200_000)
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (state >> 24) as u8
+            })
+            .collect();
+
+        let squeezable_id = FIoChunkIdRaw { id: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2] };
+        let noise_id = FIoChunkIdRaw { id: [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2] };
+
+        let compressed_path = out.join("compressed.utoc");
+        let mut writer = IoStoreWriter::new(&compressed_path, EIoStoreTocVersion::DirectoryIndex, None, "../../../".into())?;
+        writer.use_compression_method_if_unset(Some(CompressionMethod::Zlib));
+        writer.write_chunk_raw(squeezable_id, None, &squeezable)?;
+        writer.write_chunk_raw(noise_id, None, &noise)?;
+        writer.finalize()?;
+
+        let toc: Toc = BufReader::new(fs::File::open(&compressed_path)?).de_ctx(Arc::new(Config::default()))?;
+        assert!(toc.container_flags.contains(EIoContainerFlags::Compressed), "container flags: {:?}", toc.container_flags);
+        assert!(toc.chunk_metas[0].flags.contains(FIoStoreTocEntryMetaFlags::Compressed), "the squeezable chunk is not marked compressed");
+        assert!(!toc.chunk_metas[1].flags.contains(FIoStoreTocEntryMetaFlags::Compressed), "the incompressible chunk is marked compressed");
+
+        // Без сжатия не должно стоять ни одного из двух флагов.
+        let plain_path = out.join("plain.utoc");
+        let mut writer = IoStoreWriter::new(&plain_path, EIoStoreTocVersion::DirectoryIndex, None, "../../../".into())?;
+        writer.write_chunk_raw(squeezable_id, None, &squeezable)?;
+        writer.finalize()?;
+
+        let toc: Toc = BufReader::new(fs::File::open(&plain_path)?).de_ctx(Arc::new(Config::default()))?;
+        assert!(!toc.container_flags.contains(EIoContainerFlags::Compressed), "container flags: {:?}", toc.container_flags);
+        assert!(!toc.chunk_metas[0].flags.contains(FIoStoreTocEntryMetaFlags::Compressed), "an uncompressed chunk is marked compressed");
         Ok(())
     }
 

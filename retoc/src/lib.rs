@@ -523,9 +523,20 @@ impl ReadableCtx<Arc<Config>> for Toc {
 }
 impl Writeable for Toc {
     fn ser<S: Write>(&self, s: &mut S) -> Result<()> {
+        // Флаги выводятся из того, что в контейнере на самом деле, а не переносятся из
+        // прочитанного: `Toc::ser` вызывается только для заново собранного контейнера.
+        //
+        // `Compressed` не выставлялся никогда. Оригинал игры говорит
+        // `Compressed | Indexed`, а наш контейнер с теми же 9,6 ГБ zlib-блоков и той же
+        // таблицей методов - только `Indexed`. Движок читает по методу каждого блока и
+        // этого не замечает, но любой инструмент, который смотрит на флаг, получает
+        // прямо противоположный ответ - включая собственный `info` retoc.
         let mut container_flags = EIoContainerFlags::empty();
 
         container_flags |= EIoContainerFlags::Indexed;
+        if !self.compression_methods.is_empty() {
+            container_flags |= EIoContainerFlags::Compressed;
+        }
         let mut directory_index_buffer = vec![];
         self.directory_index.ser(&mut Cursor::new(&mut directory_index_buffer))?;
         // TODO encrypt directory index
