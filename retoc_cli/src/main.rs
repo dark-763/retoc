@@ -790,18 +790,29 @@ fn action_to_legacy_inner(args: ActionToLegacy, config: Arc<Config>, file_writer
         matched += action_to_legacy_shaders(&args, file_writer, &*iostore, log)?;
         ran = true;
     }
-    // A filter that matches nothing used to extract nothing and exit successfully,
-    // which reads exactly like a finished extraction. Same guard as `to-zen` has.
-    if ran && matched == 0 && !args.filter.is_empty() {
-        bail!("--filter {} matched nothing in {:?}: no package and no shader library was extracted. Check the spelling of the filter, or drop it to extract everything.",
-            args.filter.iter().map(|f| format!("'{f}'")).collect::<Vec<_>>().join(", "),
-            args.input);
-    }
+    let mut wrote_script_objects = false;
     if !args.no_script_objects && iostore.container_file_version().is_some() && iostore.container_file_version().unwrap() > EIoStoreTocVersion::PerfectHash {
         let script_objects = iostore.load_script_objects()?;
         let mut script_objects_buffer: Vec<u8> = Vec::new();
         script_objects.serialize_new(&mut Cursor::new(&mut script_objects_buffer))?;
         file_writer.write_file(String::from("scriptobjects.bin"), false, script_objects_buffer)?;
+        wrote_script_objects = true;
+    }
+    // An extraction that produced nothing used to exit successfully, which reads exactly
+    // like a finished one. The guard used to cover only the `--filter` case; an input
+    // directory holding no .utoc at all, or a container whose header failed to parse - and
+    // so reports no packages - went through it untouched and left an empty output
+    // directory behind, looking extracted.
+    if ran && matched == 0 && !wrote_script_objects {
+        if !args.filter.is_empty() {
+            bail!("--filter {} matched nothing in {:?}: no package and no shader library was extracted. Check the spelling of the filter, or drop it to extract everything.",
+                args.filter.iter().map(|f| format!("'{f}'")).collect::<Vec<_>>().join(", "),
+                args.input);
+        }
+        bail!(
+            "nothing to extract from {:?}: the input holds no package and no shader library. If it is a directory, check that it actually contains the .utoc files; if it is a single container, check that its header parses - a container reporting zero packages looks exactly like this.",
+            args.input
+        );
     }
     Ok(())
 }
@@ -908,13 +919,12 @@ fn action_to_legacy_shaders(args: &ActionToLegacy, file_writer: &dyn FileWriterT
 fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
     let mount_point = UEPath::new("../../../");
 
+    let input_path = args.input.clone();
     let input: Box<dyn FileReaderTrait> = if args.input.is_dir() { Box::new(FSFileReader::new(args.input)) } else { Box::new(PakFileReader::new(args.input)?) };
 
     let container_header_version = config.container_header_version_override.unwrap_or(args.version.container_header_version());
 
     let toc_version = config.toc_version_override.unwrap_or(args.version.toc_version());
-
-    let mut writer = IoStoreWriter::new(&args.output, toc_version, Some(container_header_version), mount_point.into())?;
 
     let log = Log::new_stdout(args.verbose, args.debug);
     let mut asset_paths = vec![];
@@ -960,12 +970,30 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
         }
     }
 
-    // A filter that matches nothing used to run to completion and write an empty container
-    // with a zero exit code, which reads exactly like a successful build. Fail instead.
-    if !args.filter.is_empty() && asset_paths.is_empty() && shader_lib_paths.is_empty() {
-        bail!("--filter {} matched no asset in the input: nothing would be converted. Check the spelling of the filter, or drop it to convert everything.",
-            args.filter.iter().map(|f| format!("'{f}'")).collect::<Vec<_>>().join(", "));
+    // An input that yields nothing used to run to completion and write an empty container
+    // with a zero exit code, which reads exactly like a successful build - a .utoc of a
+    // couple of hundred bytes next to a .ucas of a few dozen. Installed over a working
+    // build, that is the whole patch gone. Fail instead.
+    //
+    // The guard used to cover only the `--filter` case; a mistyped input path, or one
+    // pointing at uncooked assets with no split exports file, went through it untouched.
+    if asset_paths.is_empty() && shader_lib_paths.is_empty() {
+        if !args.filter.is_empty() {
+            bail!("--filter {} matched no asset in the input: nothing would be converted. Check the spelling of the filter, or drop it to convert everything.",
+                args.filter.iter().map(|f| format!("'{f}'")).collect::<Vec<_>>().join(", "));
+        }
+        bail!(
+            "nothing to convert in {:?}: found no cooked package and no shader library among the {} files there. A cooked package is a .uasset or .umap WITH a .uexp of the same name next to it.",
+            input_path,
+            files.len()
+        );
     }
+
+    // The writer is created only once the input is known to be worth converting: it
+    // truncates both output files the moment it opens them, so building it earlier meant
+    // a run that failed on an empty input still left a zero-length .utoc behind - and
+    // wiped a good container if the output path happened to point at one.
+    let mut writer = IoStoreWriter::new(&args.output, toc_version, Some(container_header_version), mount_point.into())?;
 
     // Convert shader libraries first, since the data contained in their asset metadata is needed to build the package store entries
     let mut package_name_to_referenced_shader_maps: HashMap<String, Vec<FSHAHash>> = HashMap::new();
