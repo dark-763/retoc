@@ -348,14 +348,24 @@ impl IoStoreContainer {
         if let Some(header_chunk) = header_chunk {
             let chunk_id = header_chunk.id();
             let data = container.read(chunk_id)?;
-            match FIoContainerHeader::deserialize(&mut std::io::Cursor::new(&data), config.container_header_version_override) {
-                Ok(header) => {
-                    container.container_header = Some(header);
-                }
-                Err(err) => {
-                    eprintln!("Failed to parse ContainerHeader ({chunk_id:?}). Package metadata will be unavailable: {err:?}");
-                }
-            }
+            // Раньше здесь печаталось предупреждение и контейнер жил дальше с
+            // `container_header: None`. Отличить такой контейнер от контейнера без
+            // заголовка (`global.utoc`) ниже по коду нечем, и всё вело себя так, будто
+            // пакетов в нём нет вовсе: `to-legacy` извлекал ноль и возвращал успех,
+            // `unpack-raw` писал пустой `package_store_entries`, а `pack-raw` по такому
+            // манифесту собирал контейнер без единого пакета. Причём сообщение шло в
+            // stderr мимо `Log`, то есть обвязка, читающая stdout, его не видела.
+            //
+            // Заголовок есть, но не читается - это ошибка. Заголовка нет вовсе - норма,
+            // и разбирается она выше, отсутствием чанка.
+            let header = FIoContainerHeader::deserialize(&mut std::io::Cursor::new(&data), config.container_header_version_override)
+                .with_context(|| {
+                    format!(
+                        "failed to parse the container header of {:?} ({chunk_id:?}). Every package of this container lives in that header, so nothing can be read from it. If the container is of an engine version retoc guesses wrong, name the header version with --override-container-header-version",
+                        container.name
+                    )
+                })?;
+            container.container_header = Some(header);
         }
 
         Ok(container)
@@ -448,6 +458,35 @@ impl IoStoreTrait for IoStoreContainer {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Заголовок, который не разбирается, - это ошибка открытия контейнера, а не
+    /// предупреждение. Иначе контейнер выглядит просто пустым, и всё, что считает
+    /// пакеты, честно сообщает ноль.
+    #[test]
+    fn a_container_header_that_does_not_parse_is_an_error() -> Result<()> {
+        use crate::iostore_writer::IoStoreWriter;
+        use crate::{EIoStoreTocVersion, FIoChunkIdRaw};
+        use fs_err as fs;
+
+        let out = std::env::temp_dir().join("retoc-test-bad-container-header");
+        fs::create_dir_all(&out)?;
+        let toc_path = out.join("bad.utoc");
+
+        // 10 - ContainerHeader в схеме идентификаторов до UE5.
+        let header_id = FIoChunkIdRaw { id: [7, 7, 7, 7, 7, 7, 7, 7, 0, 0, 0, 10] };
+        let mut writer = IoStoreWriter::new(&toc_path, EIoStoreTocVersion::DirectoryIndex, None, "../../../".into())?;
+        writer.write_chunk_raw(header_id, None, b"this is not a container header")?;
+        writer.finalize()?;
+
+        let opened = IoStoreContainer::open(&toc_path, Arc::new(Config::default()));
+        let err = match opened {
+            Ok(_) => panic!("opening a container with an unparsable header should fail"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+        assert!(message.contains("failed to parse the container header"), "unexpected error: {message}");
+        Ok(())
+    }
 
     #[test]
     fn test_sort_container() {
