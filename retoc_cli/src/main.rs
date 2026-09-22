@@ -692,6 +692,44 @@ fn action_unpack_raw(args: ActionUnpackRaw, config: Arc<Config>) -> Result<()> {
 fn action_pack_raw(args: ActionPackRaw, _config: Arc<Config>) -> Result<()> {
     let manifest: raw::RawIoManifest = serde_json::from_reader(BufReader::new(fs::File::open(args.input.join("manifest.json"))?))?;
 
+    // Сначала опись каталога, потом проверки, и только потом запись: контейнер
+    // открывается на запись усечением, так что упасть после создания писателя - значит
+    // оставить за собой обрубок, а на месте выхода мог лежать рабочий контейнер.
+    let chunks_dir = args.input.join("chunks");
+    let mut chunk_files: Vec<(FIoChunkIdRaw, PathBuf)> = Vec::new();
+    for entry in chunks_dir.read_dir()? {
+        let entry = entry?;
+        let chunk_id = FIoChunkIdRaw::from_str(entry.file_name().to_string_lossy().as_ref())
+            .with_context(|| format!("chunk file {:?} is not named after a chunk id", entry.file_name()))?;
+        chunk_files.push((chunk_id, entry.path()));
+    }
+
+    // Пакуется то, что лежит в каталоге, а манифест на это только смотрит. Пропавший
+    // файл чанка поэтому не ошибка, а тишина: пакет просто не попадает ни в контейнер,
+    // ни в заголовок. Каталог правит `patch_smart.py`, подменяя файлы чанков, - то есть
+    // ровно та поверхность, на которой такая пропажа и появляется.
+    let present: HashSet<raw::ChunkId> = chunk_files.iter().map(|(id, _)| (*id).into()).collect();
+    // Через множество, а не списком: один и тот же чанк значится и в записях пакетов, и
+    // в путях, и в списке пропавших он иначе удваивается.
+    let missing: std::collections::BTreeSet<&raw::ChunkId> = manifest.package_store_entries.keys().chain(manifest.chunk_paths.keys()).filter(|id| !present.contains(*id)).collect();
+    if !missing.is_empty() {
+        let shown: Vec<String> = missing
+            .iter()
+            .take(5)
+            .map(|id| match manifest.chunk_paths.get(id) {
+                Some(path) => path.clone(),
+                None => hex::encode(id.0.id),
+            })
+            .collect();
+        bail!(
+            "{} chunk(s) named by the manifest have no file in {:?}: {}{}. Packing would leave those packages out of the container and out of its header, with nothing said about it.",
+            missing.len(),
+            chunks_dir,
+            shown.join(", "),
+            if missing.len() > shown.len() { format!(", and {} more", missing.len() - shown.len()) } else { String::new() }
+        );
+    }
+
     let mut writer = IoStoreWriter::new(args.utoc, manifest.version, manifest.container_header_version, manifest.mount_point.into())?;
 
     // Метод сжатия из манифеста, если RETOC_COMPRESSION не задана. Иначе распаковка
@@ -714,9 +752,9 @@ fn action_pack_raw(args: ActionPackRaw, _config: Arc<Config>) -> Result<()> {
         (Some(used), _) => println!("compressing with {used:?}"),
         (None, _) => println!("writing uncompressed"),
     }
-    for entry in args.input.join("chunks").read_dir()? {
-        let entry = entry?;
-        let chunk_id = FIoChunkIdRaw::from_str(entry.file_name().to_string_lossy().as_ref())?;
+    let mut packages_without_entry: Vec<String> = Vec::new();
+    for (chunk_id, chunk_path) in &chunk_files {
+        let chunk_id = *chunk_id;
         let chunk_id_key: raw::ChunkId = chunk_id.into();
 
         // A directory of raw chunks produced by `unpack-raw` includes a copy of the
@@ -737,19 +775,35 @@ fn action_pack_raw(args: ActionPackRaw, _config: Arc<Config>) -> Result<()> {
         // Имя файла чанка - это то, что лежит в каталоге, то есть вход без гарантий:
         // байт типа в нём может быть любым, а `from_raw` на неизвестном паникует.
         let full_chunk_id = FIoChunkId::try_from_raw(chunk_id, writer.container_version())
-            .with_context(|| format!("chunk file {:?} does not name a chunk of this container's version", entry.file_name()))?;
+            .with_context(|| format!("chunk file {chunk_path:?} does not name a chunk of this container's version"))?;
         if full_chunk_id.get_chunk_type() == EIoChunkType::ContainerHeader {
             continue;
         }
 
         let path = manifest.chunk_paths.get(&chunk_id_key).map(UEPath::new);
-        let data = fs::read(entry.path())?;
+        let data = fs::read(chunk_path)?;
         if let Some(store_entry) = manifest.package_store_entries.get(&chunk_id_key) {
             writer.write_package_chunk(full_chunk_id, path, &data, store_entry)?;
         } else {
+            if full_chunk_id.get_chunk_type() == EIoChunkType::ExportBundleData {
+                // Пакет без записи в хранилище попадёт в контейнер чанком, но не попадёт
+                // в его заголовок, а движок ищет пакеты именно там: файл есть, пакета
+                // нет. Молча этого делать нельзя.
+                packages_without_entry.push(path.map(|p| p.to_string()).unwrap_or_else(|| hex::encode(chunk_id.id)));
+            }
             writer.write_chunk_raw(chunk_id, path, &data)?;
         }
     }
+
+    if !packages_without_entry.is_empty() {
+        bail!(
+            "{} package chunk(s) have a file but no entry in the manifest's `package_store_entries`: {}{}. They would end up in the container without being in its header, which is the same as not being there at all.",
+            packages_without_entry.len(),
+            packages_without_entry.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+            if packages_without_entry.len() > 5 { format!(", and {} more", packages_without_entry.len() - 5) } else { String::new() }
+        );
+    }
+
     writer.finalize()?;
     Ok(())
 }
