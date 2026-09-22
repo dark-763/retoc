@@ -39,6 +39,9 @@ use std::{
 struct ActionManifest {
     #[arg(index = 1)]
     utoc: PathBuf,
+    /// Output .json (defaults to pakstore.json in the current directory)
+    #[arg(index = 2)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -350,12 +353,21 @@ fn action_manifest(args: ActionManifest, config: Arc<Config>) -> Result<()> {
             bulkdata: vec![],
         };
 
-        let bulk_id = FIoChunkId::from_package_id(package_info.id(), 0, EIoChunkType::BulkData).with_version(toc_version);
-        if iostore.has_chunk_id(bulk_id) {
-            entry.bulkdata.push(manifest::ChunkData {
-                id: bulk_id.get_raw(),
-                filename: UEPath::new(&package_path).with_extension("ubulk").to_string(),
-            });
+        // Пакет может нести три вида объёмных данных, а записывался только первый:
+        // `.uptnl` и `.m.ubulk` в описи не появлялись вовсе, хотя в контейнере лежат.
+        // В нашем контейнере, например, восемь чанков OptionalBulkData.
+        for (chunk_type, extension) in [
+            (EIoChunkType::BulkData, "ubulk"),
+            (EIoChunkType::OptionalBulkData, "uptnl"),
+            (EIoChunkType::MemoryMappedBulkData, "m.ubulk"),
+        ] {
+            let bulk_id = FIoChunkId::from_package_id(package_info.id(), 0, chunk_type).with_version(toc_version);
+            if iostore.has_chunk_id(bulk_id) {
+                entry.bulkdata.push(manifest::ChunkData {
+                    id: bulk_id.get_raw(),
+                    filename: UEPath::new(&package_path).with_extension(extension).to_string(),
+                });
+            }
         }
 
         entries.lock().unwrap().push(entry);
@@ -368,10 +380,12 @@ fn action_manifest(args: ActionManifest, config: Arc<Config>) -> Result<()> {
 
     let manifest = manifest::PackageStoreManifest { oplog: manifest::OpLog { entries } };
 
-    let path = "pakstore.json";
-    fs::write(path, serde_json::to_vec(&manifest)?)?;
+    // Путь был жёстко задан и всегда относителен текущего каталога: две описи подряд
+    // затирали друг друга, а положить её рядом с контейнером было нельзя.
+    let path = args.output.unwrap_or_else(|| PathBuf::from("pakstore.json"));
+    fs::write(&path, serde_json::to_vec(&manifest)?)?;
 
-    println!("wrote {} entries to {}", manifest.oplog.entries.len(), path);
+    println!("wrote {} entries to {}", manifest.oplog.entries.len(), path.to_string_lossy());
 
     Ok(())
 }
@@ -532,7 +546,23 @@ fn action_unpack(args: ActionUnpack, config: Arc<Config>) -> Result<()> {
         },
     )?;
 
-    println!("unpacked {} files to {}", toc.file_map.len(), output.to_string_lossy());
+    // `unpack` достаёт только то, что есть в индексе каталогов: у чанка без пути нет
+    // имени, под которым его можно положить на диск. Сообщение об этом молчало, и
+    // "unpacked N files" читалось как "распакован весь контейнер". В нашем контейнере
+    // без пути один только заголовок, но в контейнере с шейдерами так пропали бы все
+    // чанки ShaderCode.
+    let skipped = toc.chunks.len().saturating_sub(toc.file_map.len());
+    if skipped == 0 {
+        println!("unpacked {} files to {}", toc.file_map.len(), output.to_string_lossy());
+    } else {
+        println!(
+            "unpacked {} files to {} ({} of {} chunks; {skipped} chunk(s) have no path in the directory index and were skipped - use unpack-raw to get every chunk)",
+            toc.file_map.len(),
+            output.to_string_lossy(),
+            toc.file_map.len(),
+            toc.chunks.len()
+        );
+    }
 
     Ok(())
 }
@@ -1035,7 +1065,10 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
             shader_lib_paths.push(path);
         }
         // If folder we are given contains copy of script objects, parse them and use them for VNI support and import checking
-        if toc_version > EIoStoreTocVersion::PerfectHash && path.file_name() == Some("scriptobjects.bin") {
+        // Сравнение без учёта регистра: `to-legacy` пишет имя строчными, и свой же круг
+        // сходился, но каталог из любого другого источника несёт `ScriptObjects.bin`, и
+        // объекты скрипта молча не подхватывались.
+        if toc_version > EIoStoreTocVersion::PerfectHash && path.file_name().is_some_and(|name| name.eq_ignore_ascii_case("scriptobjects.bin")) {
             let script_object_buffer = input.read(path).with_context(|| format!("Failed to read script objects file: {}", path))?;
             script_objects = Some(Arc::new(ZenScriptObjects::deserialize_new(&mut Cursor::new(script_object_buffer))?));
         }
