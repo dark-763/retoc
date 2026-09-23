@@ -1,9 +1,11 @@
 > **Which branch to use**
 >
-> Build from **`ue426-repack`**. It carries everything described below and is
+> Build from **`ue426`**. It carries everything described below and is
 > the working version; `algo-global-pass`, where this work was done, is merged
-> into it. The **`pack-raw-compression`** branch exists only as a clean,
-> single-purpose branch for the upstream pull request: it has the compression
+> into it. `ue426-repack` is an earlier state kept unchanged as the head of
+> upstream pull request #76; do not build from it. The
+> **`pack-raw-compression`** branch exists only as a clean,
+> single-purpose branch for upstream: it has the compression
 > change alone, on top of an otherwise unmodified `master`, and will not
 > convert this game's assets.
 
