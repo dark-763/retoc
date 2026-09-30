@@ -97,6 +97,11 @@ struct ActionUnpackRaw {
     utoc: PathBuf,
     #[arg(index = 2)]
     output: PathBuf,
+
+    /// Unpack only the chunks whose path contains this text; may be given several times.
+    /// The manifest then lists only those chunks
+    #[arg(short, long)]
+    filter: Vec<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -657,9 +662,6 @@ fn action_unpack_raw(args: ActionUnpackRaw, config: Arc<Config>) -> Result<()> {
     let chunks_dir = output.join("chunks");
     let manifest_path = output.join("manifest.json");
 
-    fs::create_dir(&output)?;
-    fs::create_dir(&chunks_dir)?;
-
    let mut manifest = raw::RawIoManifest {
     chunk_paths: Default::default(),
     version: iostore.container_file_version().context("this input has no container")?,
@@ -678,8 +680,28 @@ fn action_unpack_raw(args: ActionUnpackRaw, config: Arc<Config>) -> Result<()> {
     // В манифест результаты складываются потом, одним потоком, и в упорядоченные
     // отображения по id чанка: файл не зависит ни от того, какой поток успел
     // первым, ни от порядка обхода хеш-таблицы.
-    let all_chunks: Vec<_> = iostore.chunks().collect();
+    // With --filter only the chunks with a matching path are taken, and the manifest
+    // lists only them: the dump is then a complete description of a smaller container,
+    // which `pack-raw` packs as it is. A chunk with no path cannot match; the container
+    // header is one, and it goes into the manifest regardless.
+    let all_chunks: Vec<_> = if args.filter.is_empty() {
+        iostore.chunks().collect()
+    } else {
+        iostore
+            .chunks()
+            .filter(|chunk| chunk.id().get_chunk_type() == EIoChunkType::ContainerHeader || chunk.path().is_some_and(|path| args.filter.iter().any(|f| path.contains(f))))
+            .collect()
+    };
+    if !args.filter.is_empty() && all_chunks.iter().all(|chunk| chunk.id().get_chunk_type() == EIoChunkType::ContainerHeader) {
+        bail!(
+            "--filter {} matched no chunk path in the container: nothing to unpack. Check the spelling of the filter, or drop it to unpack everything.",
+            args.filter.iter().map(|f| format!("'{f}'")).collect::<Vec<_>>().join(", ")
+        );
+    }
     let chunk_count = all_chunks.len();
+    // Created only now: a run that stops on one of the checks above leaves nothing behind.
+    fs::create_dir(&output)?;
+    fs::create_dir(&chunks_dir)?;
     type UnpackedChunk = (FIoChunkIdRaw, Option<String>, Option<StoreEntry>);
     let unpacked: Vec<UnpackedChunk> = all_chunks
         .par_iter()
