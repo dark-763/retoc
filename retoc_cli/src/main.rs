@@ -188,6 +188,13 @@ struct ActionToZen {
     #[arg(long)]
     allow_partial: bool,
 
+    /// Directory with the original container of the game (and global.utoc). The input
+    /// then holds only the packages to replace: the export bundle layout and the load
+    /// order are computed over the packages of the base with the input ones put in
+    /// their place, and only the input packages are written. For UE 4.25-4.27
+    #[arg(long)]
+    base: Option<PathBuf>,
+
     /// Verbose logging
     #[arg(short, long)]
     verbose: bool,
@@ -1080,6 +1087,103 @@ fn action_to_legacy_shaders(args: &ActionToLegacy, file_writer: &dyn FileWriterT
     Ok(libraries_extracted)
 }
 
+/// A package of the base container, as `to-zen --base` needs it.
+struct BasePackage {
+    id: FPackageId,
+    /// Path of the package chunk with the mount point, e.g. `../../../Game/Content/A.uasset`
+    path: String,
+    /// Package name derived from the path - the same way as for an input package
+    name: String,
+    load_order: u32,
+    export_bundle_count: i32,
+}
+
+/// The original container that `to-zen --base` converts against.
+struct ToZenBase {
+    store: Box<dyn IoStoreTrait>,
+    packages: Vec<BasePackage>,
+    by_id: HashMap<FPackageId, usize>,
+}
+impl ToZenBase {
+    fn open(path: &Path, output: &Path, toc_version: EIoStoreTocVersion, container_header_version: EIoContainerHeaderVersion, config: Arc<Config>) -> Result<Self> {
+        if !path.is_dir() {
+            bail!("--base {path:?} is not a directory. Give the directory that holds the original container together with global.utoc: the packages of the base are brought to legacy form, and that needs the global container.");
+        }
+        let store = iostore::open(path, config).with_context(|| format!("Failed to open the base {path:?}"))?;
+
+        // One container with packages, and it must not be the one being written: a base
+        // that already holds the patch would hand back the patched packages as originals.
+        let with_header: Vec<String> = store.child_containers().filter(|c| c.container_header().is_some()).map(|c| c.container_name().to_string()).collect();
+        if with_header.len() != 1 {
+            bail!(
+                "the base {path:?} holds {} containers with packages ({}). The bundle layout is computed for one container, so the base has to be the original container alone, next to global.utoc - not a Paks directory with patches in it.",
+                with_header.len(),
+                with_header.join(", ")
+            );
+        }
+        let output_name = output.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        if with_header[0].eq_ignore_ascii_case(&output_name) {
+            bail!("the base container and the output have the same name ({output_name}). The output is a patch for the base, not a replacement of it.");
+        }
+        let (base_toc, base_header) = (store.container_file_version(), store.container_header_version());
+        if base_toc != Some(toc_version) || base_header != Some(container_header_version) {
+            bail!(
+                "the base {path:?} is a {:?} / {:?} container, and --version asks for {toc_version:?} / {container_header_version:?}. The base has to be the container of the game the packages are converted for.",
+                base_toc,
+                base_header
+            );
+        }
+
+        let mut packages = Vec::new();
+        for package_info in store.packages() {
+            let chunk_id = FIoChunkId::from_package_id(package_info.id(), 0, EIoChunkType::ExportBundleData);
+            let path = store.chunk_path(chunk_id).with_context(|| format!("base package {:?} has no path", package_info.id()))?;
+            let stripped = path.strip_prefix("../../../").with_context(|| format!("failed to strip the mount prefix from the base package path {path}"))?;
+            let name = retoc::pak_path_to_game_path(UEPath::new(stripped)).with_context(|| format!("Failed to get Package Path from {stripped}"))?;
+            let name = name.rsplit_once('.').with_context(|| format!("base package path {path} has no extension"))?.0.to_string();
+            if FPackageId::from_name(&name) != package_info.id() {
+                bail!("the base package {path} has the id {:?}, and its path gives {:?}. Package ids of this container do not follow from paths, so input packages cannot be matched to it.", package_info.id(), FPackageId::from_name(&name));
+            }
+            let store_entry = store.package_store_entry(package_info.id()).with_context(|| format!("base package {path} has no store entry"))?;
+            packages.push(BasePackage { id: package_info.id(), path, name, load_order: store_entry.load_order, export_bundle_count: store_entry.export_bundle_count });
+        }
+        if packages.is_empty() {
+            bail!("the base {path:?} holds no packages");
+        }
+        let by_id = packages.iter().enumerate().map(|(index, package)| (package.id, index)).collect();
+        Ok(Self { store, packages, by_id })
+    }
+
+    /// The pass has to give every package the input does not touch the layout it has in
+    /// the base. If it does not, the result would be a patch whose own packages are laid
+    /// out for a container that is not the one in the game: either the base is not the
+    /// container these packages belong to, or the input changes a package so that the
+    /// layout of its neighbours moves - and those neighbours stay in the base as they
+    /// are. Both are errors here, not warnings: nothing is written.
+    fn check_layout(&self, layout: &retoc::bundle_layout_pass::ContainerBundleLayout, input_package_ids: &HashSet<FPackageId>) -> Result<()> {
+        let mut moved: Vec<String> = Vec::new();
+        let mut unchanged = 0usize;
+        for package in self.packages.iter().filter(|p| !input_package_ids.contains(&p.id)) {
+            unchanged += 1;
+            let load_order = layout.load_order_of(package.id);
+            let bundle_count = layout.layout_of(package.id).map(|bundles| bundles.len() as i32);
+            if load_order != Some(package.load_order) || bundle_count != Some(package.export_bundle_count) {
+                moved.push(format!("{} (load order {} -> {:?}, export bundles {} -> {:?})", package.name, package.load_order, load_order, package.export_bundle_count, bundle_count));
+            }
+        }
+        if !moved.is_empty() {
+            bail!(
+                "the base does not fit: {} of its {} packages that the input leaves alone would get another bundle layout than they have in the base container, e.g. {}{}. Either the base is not the container these packages come from, or an input package changed in a way that moves its neighbours. Nothing was written; convert the whole game instead.",
+                moved.len(),
+                unchanged,
+                moved.iter().take(3).cloned().collect::<Vec<_>>().join("; "),
+                if moved.len() > 3 { format!("; and {} more", moved.len() - 3) } else { String::new() }
+            );
+        }
+        Ok(())
+    }
+}
+
 fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
     let mount_point = UEPath::new("../../../");
 
@@ -1180,6 +1284,75 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
         }
     }
 
+    // The pass runs before the writer exists, like every other check here: if it stops -
+    // a cycle, a base that does not fit - the output files are not touched.
+    // Construct Verse Cell Store and populate it with intrinsics, as well as command line overrides
+    let script_cell_store = build_verse_cell_store(&args.script_cell);
+
+    // The export bundle layout and the package load order are decided for the container
+    // as a whole, so they have to be computed before any package is converted - and over
+    // EVERY package of the input, not just the filtered ones, or the global bundle
+    // numbering would be wrong. `--filter` narrows what gets written, never what the pass
+    // sees.
+    //
+    // With `--base` the container is the original one with the input packages put in
+    // place of their originals: the pass sees every package of the base, in the legacy
+    // form `to-legacy` gives it, and the input ones as they are in the input. That is
+    // exactly the input of a full conversion of the whole game with these packages
+    // replaced, so the layout and the load order come out the same - without reading or
+    // writing the other seventeen thousand from disk as legacy files.
+    let base = match &args.base {
+        Some(path) => {
+            if container_header_version > EIoContainerHeaderVersion::Initial {
+                bail!("--base is for container header versions up to Initial (UE 4.25-4.27). Later versions have no container-wide bundle layout: convert the packages on their own.");
+            }
+            Some(ToZenBase::open(path, &args.output, toc_version, container_header_version, config.clone())?)
+        }
+        None => None,
+    };
+    let base_context = base.as_ref().map(|b| FZenPackageContext::create(&*b.store, Some(args.version.package_file_version()), &log, Some(script_cell_store.clone())));
+
+    if container_header_version <= EIoContainerHeaderVersion::Initial {
+        let mut pass_input: Vec<retoc::bundle_layout_pass::PassInput> = Vec::with_capacity(all_asset_paths.len());
+        info!(&log, "Computing export bundle layout over {} packages", all_asset_paths.len());
+        for path in &all_asset_paths {
+            let asset_buffer = input.read(path)?;
+            let header = retoc::legacy_asset::FLegacyPackageHeader::deserialize(&mut Cursor::new(asset_buffer), Some(args.version.package_file_version()))
+                .with_context(|| format!("Failed to read the legacy package header of {path} for the bundle layout pass"))?;
+            let stripped = mount_point.join(path);
+            let stripped = stripped.strip_prefix("../../../").unwrap();
+            let package_name = retoc::pak_path_to_game_path(stripped)
+                .with_context(|| format!("Failed to get Package Path from {stripped}"))?;
+            let package_name = package_name.rsplit_once('.').unwrap().0.to_string();
+            pass_input.push(retoc::bundle_layout_pass::PassInput {
+                package_id: retoc::FPackageId::from_name(&package_name),
+                package_name,
+                header,
+            });
+        }
+        let input_package_ids: HashSet<FPackageId> = pass_input.iter().map(|p| p.package_id).collect();
+        if let (Some(base), Some(base_context)) = (&base, &base_context) {
+            let unchanged: Vec<&BasePackage> = base.packages.iter().filter(|p| !input_package_ids.contains(&p.id)).collect();
+            info!(&log, "Base: {} packages, {} of them replaced by the input; reading the other {} from the base", base.packages.len(), base.packages.len() - unchanged.len(), unchanged.len());
+            let package_file_version = args.version.package_file_version();
+            let from_base: Vec<retoc::bundle_layout_pass::PassInput> = unchanged
+                .par_iter()
+                .map(|package| -> Result<retoc::bundle_layout_pass::PassInput> {
+                    let asset_buffer = asset_conversion::build_legacy_header_in_memory(base_context, package.id).with_context(|| format!("Failed to bring the base package {} to legacy form", package.path))?;
+                    let header = retoc::legacy_asset::FLegacyPackageHeader::deserialize(&mut Cursor::new(asset_buffer), Some(package_file_version))
+                        .with_context(|| format!("Failed to read the legacy package header of the base package {}", package.path))?;
+                    Ok(retoc::bundle_layout_pass::PassInput { package_id: package.id, package_name: package.name.clone(), header })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            pass_input.extend(from_base);
+        }
+        let layout = retoc::bundle_layout_pass::compute_container_bundle_layout(pass_input, &log)?;
+        if let Some(base) = &base {
+            base.check_layout(&layout, &input_package_ids)?;
+        }
+        zen_asset_conversion::set_container_bundle_layout(layout);
+    }
+
     // The writer is created only once the input is known to be worth converting: it
     // truncates both output files the moment it opens them, so building it earlier meant
     // a run that failed on an empty input still left a zero-length .utoc behind - and
@@ -1202,36 +1375,6 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
 
         // Convert shader library to the container shader chunks
         shader_library::write_io_store_library(&mut writer, &shader_library_buffer, &mount_point.join(path), &log)?;
-    }
-
-    // Construct Verse Cell Store and populate it with intrinsics, as well as command line overrides
-    let script_cell_store = build_verse_cell_store(&args.script_cell);
-
-    // The export bundle layout and the package load order are decided for the container
-    // as a whole, so they have to be computed before any package is converted - and over
-    // EVERY package of the input, not just the filtered ones, or the global bundle
-    // numbering would be wrong. `--filter` narrows what gets written, never what the pass
-    // sees.
-    if container_header_version <= EIoContainerHeaderVersion::Initial {
-        let mut pass_input: Vec<retoc::bundle_layout_pass::PassInput> = Vec::with_capacity(all_asset_paths.len());
-        info!(&log, "Computing export bundle layout over {} packages", all_asset_paths.len());
-        for path in &all_asset_paths {
-            let asset_buffer = input.read(path)?;
-            let header = retoc::legacy_asset::FLegacyPackageHeader::deserialize(&mut Cursor::new(asset_buffer), Some(args.version.package_file_version()))
-                .with_context(|| format!("Failed to read the legacy package header of {path} for the bundle layout pass"))?;
-            let stripped = mount_point.join(path);
-            let stripped = stripped.strip_prefix("../../../").unwrap();
-            let package_name = retoc::pak_path_to_game_path(stripped)
-                .with_context(|| format!("Failed to get Package Path from {stripped}"))?;
-            let package_name = package_name.rsplit_once('.').unwrap().0.to_string();
-            pass_input.push(retoc::bundle_layout_pass::PassInput {
-                package_id: retoc::FPackageId::from_name(&package_name),
-                package_name,
-                header,
-            });
-        }
-        let layout = retoc::bundle_layout_pass::compute_container_bundle_layout(pass_input, &log)?;
-        zen_asset_conversion::set_container_bundle_layout(layout);
     }
 
     let progress = Some(indicatif::ProgressBar::new(asset_paths.len() as u64).with_style(progress_style()));
@@ -1313,6 +1456,48 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
                 let converted_arc = Arc::new(RwLock::new(converted));
                 converted_lookup.insert(converted_arc.read().unwrap().package_id, converted_arc.clone());
                 all_converted.push(converted_arc);
+            }
+
+            // The fix-up resolves each external arc through the converted form of the
+            // package it points into. In a full conversion every package of the container
+            // is there; with `--base` only the input ones are, so the base packages the
+            // input refers to are converted here as well - the same way, from the same
+            // legacy form - and used for the lookup only. They are not written.
+            if let (Some(base), Some(base_context)) = (&base, &base_context) {
+                let mut wanted: Vec<&BasePackage> = Vec::new();
+                let mut seen: HashSet<FPackageId> = HashSet::default();
+                for converted in &all_converted {
+                    for package_id in converted.read().unwrap().external_arc_source_packages() {
+                        if !converted_lookup.contains_key(&package_id)
+                            && seen.insert(package_id)
+                            && let Some(package) = base.by_id.get(&package_id)
+                        {
+                            wanted.push(&base.packages[*package]);
+                        }
+                    }
+                }
+                info!(log, "Converting {} base packages the input refers to", wanted.len());
+                let referenced: Vec<ConvertedZenAssetBundle> = wanted
+                    .par_iter()
+                    .map(|package| -> Result<ConvertedZenAssetBundle> {
+                        let bundle = asset_conversion::build_legacy_in_memory(base_context, package.id).with_context(|| format!("Failed to bring the base package {} to legacy form", package.path))?;
+                        zen_asset_conversion::build_zen_asset(
+                            bundle,
+                            &package_name_to_referenced_shader_maps,
+                            UEPath::new(&package.path),
+                            Some(args.version.package_file_version()),
+                            container_header_version,
+                            needs_asset_import_fixup,
+                            script_objects.clone(),
+                            Some(script_cell_store.clone()),
+                            &log,
+                        )
+                        .with_context(|| format!("Failed to convert the base package {}", package.path))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for converted in referenced {
+                    converted_lookup.insert(converted.package_id, Arc::new(RwLock::new(converted)));
+                }
             }
 
             info!(log, "Applying import fix-ups to the converted assets. Package data in memory: {}MB", total_package_data_size / 1024 / 1024);

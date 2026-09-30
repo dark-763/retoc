@@ -1495,12 +1495,22 @@ fn rebuild_asset_export_data_internal(builder: &LegacyAssetBuilder, raw_exports_
     Ok(result_exports_data)
 }
 
-// Serializes an asset into in-memory buffer. Returns each region of the associated asset as a separate buffer
-fn serialize_asset(builder: &LegacyAssetBuilder) -> anyhow::Result<FSerializedAssetBundle> {
-    // Write the asset file first
+// The .uasset of the package: its header, exactly as `to-legacy` would write the file
+fn serialize_asset_header(builder: &LegacyAssetBuilder) -> anyhow::Result<Vec<u8>> {
     let mut asset_file_buffer: Vec<u8> = Vec::new();
     let mut asset_cursor = Cursor::new(&mut asset_file_buffer);
     FLegacyPackageHeader::serialize(&builder.legacy_package, &mut asset_cursor, Some(builder.zen_package.summary.cooked_header_size as usize), builder.package_context.log)?;
+    Ok(asset_file_buffer)
+}
+
+// Serializes an asset into in-memory buffer. Returns each region of the associated asset as a separate buffer
+fn serialize_asset(builder: &LegacyAssetBuilder) -> anyhow::Result<FSerializedAssetBundle> {
+    serialize_asset_parts(builder, true)
+}
+
+fn serialize_asset_parts(builder: &LegacyAssetBuilder, with_bulk_data: bool) -> anyhow::Result<FSerializedAssetBundle> {
+    // Write the asset file first
+    let asset_file_buffer = serialize_asset_header(builder)?;
 
     // Copy the raw export data from the chunk into the exports file
     let raw_exports_data = builder.package_context.read_full_package_data(builder.package_id)?;
@@ -1517,9 +1527,10 @@ fn serialize_asset(builder: &LegacyAssetBuilder) -> anyhow::Result<FSerializedAs
     let memory_mapped_bulk_data_chunk_id = FIoChunkId::from_package_id(builder.package_id, 0, EIoChunkType::MemoryMappedBulkData);
 
     let store_access: &dyn IoStoreTrait = builder.package_context.store_access;
-    let bulk_data_buffer = if store_access.has_chunk_id(bulk_data_chunk_id) { Some(store_access.read(bulk_data_chunk_id)?) } else { None };
-    let optional_bulk_data_buffer = if store_access.has_chunk_id(optional_bulk_data_chunk_id) { Some(store_access.read(optional_bulk_data_chunk_id)?) } else { None };
-    let memory_mapped_bulk_data_buffer = if store_access.has_chunk_id(memory_mapped_bulk_data_chunk_id) { Some(store_access.read(memory_mapped_bulk_data_chunk_id)?) } else { None };
+    let read_bulk = |chunk_id: FIoChunkId| -> anyhow::Result<Option<Vec<u8>>> { if with_bulk_data && store_access.has_chunk_id(chunk_id) { Ok(Some(store_access.read(chunk_id)?)) } else { Ok(None) } };
+    let bulk_data_buffer = read_bulk(bulk_data_chunk_id)?;
+    let optional_bulk_data_buffer = read_bulk(optional_bulk_data_chunk_id)?;
+    let memory_mapped_bulk_data_buffer = read_bulk(memory_mapped_bulk_data_chunk_id)?;
 
     Ok(FSerializedAssetBundle {
         asset_file_buffer,
@@ -1560,6 +1571,20 @@ fn write_asset(builder: &LegacyAssetBuilder, out_asset_path: &UEPath, file_write
         file_writer.write_file(memory_mapped_bulk_data_file_path.to_string(), false, memory_mapped_bulk_data_buffer)?;
     }
     Ok(())
+}
+
+/// The .uasset that `to-legacy` would write for this package, without writing anything
+/// and without touching the export data.
+pub fn build_legacy_header_in_memory(package_context: &FZenPackageContext, package_id: FPackageId) -> anyhow::Result<Vec<u8>> {
+    let asset_builder = build_asset_from_zen(package_context, package_id)?;
+    serialize_asset_header(&asset_builder)
+}
+
+/// The .uasset and .uexp that `to-legacy` would write for this package, in memory. Bulk
+/// data is left out: this is for callers that need the package itself, not its payload.
+pub fn build_legacy_in_memory(package_context: &FZenPackageContext, package_id: FPackageId) -> anyhow::Result<FSerializedAssetBundle> {
+    let asset_builder = build_asset_from_zen(package_context, package_id)?;
+    serialize_asset_parts(&asset_builder, false)
 }
 
 pub fn build_legacy(package_context: &FZenPackageContext, package_id: FPackageId, out_path: &UEPath, file_writer: &dyn FileWriterTrait) -> anyhow::Result<()> {
