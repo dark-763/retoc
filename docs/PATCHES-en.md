@@ -220,8 +220,8 @@ every package got a redirect to itself: 17 095 entries, about 273 KB. The
 original has none. The list was also built in task completion order, which
 is why the header differed between two runs of the same command.
 A redirect is now added only when the source package id differs from the
-package's own. Two runs now give identical chunks, header included; the
-container files still differ, because chunk order follows task completion.
+package's own. Two runs now give identical chunks, header included. The
+container files themselves became identical later, see Part 5.
 
 This comes from upstream (`c0ec603`) and affects anyone converting to a UE4
 container.
@@ -238,8 +238,8 @@ Each of these returned exit code 0, or wrote output, while losing work.
     output files only after the input has been accepted, so a failed run no
     longer truncates an existing container at the output path.
 16. **`to-legacy` where every package fails**: it printed
-    `Extracted 0 (17095 failed)` and returned 0. Now it fails. A few
-    failures are still tolerated, so one bad asset does not cost the rest.
+    `Extracted 0 (17095 failed)` and returned 0. Now it fails. See 25 for
+    the case where only some of them fail.
 17. **A container header that does not parse**: a line on stderr, then
     behaviour as if the container had no packages. It is now an error.
 18. **Directory properties taken from `global`**: compression method and
@@ -263,6 +263,21 @@ Each of these returned exit code 0, or wrote output, while losing work.
     case-sensitively. `unpack` claimed to have unpacked everything.
 24. **Two binary targets named `retoc`** in the workspace: which one ended
     up in `target/release` was undefined. The stray one is removed.
+25. **`to-legacy` where some packages fail** (30 September): the count was
+    in an info line on stdout and the exit code was 0. Now
+    `N of M packages failed to convert` goes to stderr and the exit code is
+    1. The packages that did convert are still written, and a `.pak`
+    output still gets its index, so one bad asset still does not cost the
+    rest. `--allow-partial` turns the error back into a warning.
+26. **`to-zen` with an asset that has no `.uexp`** (30 September): the
+    asset was skipped with an info line, and the container was written
+    without that package. Now the run stops before anything is written.
+    `--allow-partial` converts the rest, as before.
+
+Not changed, on purpose: `unpack` still exits with 0 when chunks without a
+path are left out (the container header never has one, so every container
+would fail), and a shader library whose asset list could not be completed
+still only warns. Neither could be exercised on the data at hand.
 
 ---
 
@@ -280,6 +295,56 @@ write loop runs inside the global thread pool. Compression now has a
 thread pool of its own. The first measurements had missed the deadlock
 because they ran `to-zen` without compression, which never reaches the
 changed code.
+
+---
+
+## Part 5. The same input gives the same container
+
+`retoc_cli/src/main.rs`, `container_header.rs` (30 September)
+
+Two runs of the same `to-zen` command used to give two different pairs of
+files. The chunks were the same; their order was not. Packages were
+converted in parallel and written as each worker finished, and everything
+in a container follows the order of writing: chunk data in the `.ucas`,
+the chunk tables and the directory index in the `.utoc`.
+
+- **`to-zen`** sorts the input listing by path (plain byte order) and
+  hands converted packages to the writer in that order. Conversion is
+  still parallel. At most `2 * threads` converted packages wait for their
+  turn, so memory stays bounded when a large package holds up the ones
+  behind it.
+- **`pack-raw`** sorts the chunk files by chunk id. It used to take them
+  in directory listing order, which is sorted on NTFS and nowhere promised
+  to be.
+- **`unpack-raw`** writes `manifest.json` from ordered maps. The container
+  header kept in the manifest held a hash set and a hash map, which
+  serialize in a different order on every run.
+
+Why input order and not chunk id order for `to-zen`: the order has to be
+known before conversion, or bulk data cannot go to disk as it arrives and
+must be held in memory for a sort at the end. A UE5 package id is only
+known once the package has been read. The path is known from the listing.
+`pack-raw` has no paths for some chunks, only ids, so it sorts by id.
+
+Measured on the whole game container (17 923 packages, 20 686 chunks,
+Zlib), same output name:
+
+- two runs with 8 threads and one with `RAYON_NUM_THREADS=1` give
+  byte-identical `.utoc` and `.ucas`; the previous build gives different
+  files on every run;
+- after `unpack-raw`, every chunk and every `StoreEntry` equals what the
+  previous build produces from the same input: only the order changed;
+- `pack-raw` of that dump, twice with 8 threads and once with 1, gives
+  byte-identical files;
+- speed is unchanged within run-to-run noise: 341 s and 356 s against
+  334 s and 352 s for the previous build (8 threads, another job running
+  on the machine).
+
+What remains outside this: `to-legacy` writing into a `.pak` still adds
+entries in completion order. The container id derives from the output file
+name, so two outputs with different names are different containers.
+
+Tests: `retoc_cli/tests/determinism.rs`, `retoc_cli/tests/exit_codes.rs`.
 
 ---
 
@@ -306,12 +371,13 @@ changed code.
 
 ## Verifying a rebuild
 
-- Do not compare container files by hash. Conversion is parallel and chunk
-  order follows task completion, so two runs of the same command give
-  different files. Compare at chunk level: the set of chunk ids, the
-  content of each chunk, and every `StoreEntry` field. Keep the output file
-  name the same between runs, because the container id and the id of the
-  header chunk derive from it.
+- Two runs of the same command now give the same files (Part 5), so a
+  rebuild from the same input with the same build of retoc can be compared
+  by hash. Keep the output file name the same between runs, because the
+  container id and the id of the header chunk derive from it. Against a
+  container written by an older build, or by another tool, the order of
+  chunks differs and only a chunk-level comparison means anything: the set
+  of chunk ids, the content of each chunk, and every `StoreEntry` field.
 - `retoc verify` now works on 4.26 containers. It checks every chunk
   against its TOC hash. To confirm it can catch damage, change one byte
   inside a compressed block of a copy; it should fail.
