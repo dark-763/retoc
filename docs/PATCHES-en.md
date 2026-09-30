@@ -348,6 +348,74 @@ Tests: `retoc_cli/tests/determinism.rs`, `retoc_cli/tests/exit_codes.rs`.
 
 ---
 
+## Part 6. Converting a few packages against the original container
+
+`retoc_cli/src/main.rs`, `asset_conversion.rs`, `iostore_writer.rs` (30 September)
+
+The layout pass of Part 2 needs every package of the container, so a patch
+of 95 packages used to cost a conversion of all 17 923: about six minutes,
+after which 17 828 of the converted packages were thrown away.
+
+**`to-zen --base <dir>`.** The input holds only the packages to replace;
+`<dir>` holds the original container and `global.utoc`. The pass sees every
+package of the base, brought to legacy form in memory (headers only, the
+same code as `to-legacy`), with the input ones put in their place. That is
+exactly the input of a full conversion, so the layout and the load order
+come out the same. The base packages that the input refers to are converted
+too, in memory, because the arc fix-up resolves each external arc through
+the converted form of its source package; they are not written. Only the
+input packages are.
+
+The base is a directory with the container, not a directory of legacy
+files, for two reasons: the container is what the game loads, so there is
+nothing in between that could be stale; and its store entries give
+something to check the pass against.
+
+The conversion stops before anything is written when:
+
+- the pass does not give every base package that the input leaves alone
+  the load order and the bundle count it has in the base. Then either the
+  base is not the container these packages belong to, or an input package
+  changed in a way that moves its neighbours, which stay in the base as
+  they are;
+- the base is not a directory, holds more than one container with
+  packages (a `Paks` directory with a patch in it), has the name of the
+  output, or is of another version than `--version`;
+- a package id of the base does not follow from its path;
+- the target is later than `Initial`: there is no container-wide layout
+  there, and the packages convert on their own.
+
+Measured against a full conversion of the same game with the same packages
+replaced, chunk bytes and every `StoreEntry` field:
+
+| input | result | time, 8 threads |
+|---|---|---|
+| the 95 packages of the translation patch | 95 chunks, 0 differences | 7.5 s |
+| one texture with a `.ubulk`, unchanged | 2 chunks, 0 differences | 7.3 s |
+| one package | 1 chunk, 0 differences | 6.9 s |
+
+A full conversion takes 258 s. One thread and eight give the same files.
+Against the ORIGINAL container the unchanged texture matches in its bulk
+chunk and its store entry and differs in four bytes of the package chunk,
+`cooked_header_size` and the `cooked_serial_offset` of its export: the
+known gap below, the same in a full conversion.
+
+**Package chunks are hashed and compressed on several threads.** They are
+written after the arc fix-up, all at once, and that loop ran one chunk at a
+time: a chunk is compressed block by block in parallel, but these chunks
+are a block or two each. Hash and compression depend only on the bytes of
+the chunk, so they now run on the worker threads while the writer appends
+the results in order. A full conversion went from about 345 s to 258 s,
+and the container is byte-identical to the one the previous build writes.
+
+**`unpack-raw --filter <text>`** takes only the chunks whose path contains
+the text and lists only them in the manifest. The dump then describes a
+smaller container that `pack-raw` packs as it is.
+
+Tests: `retoc_cli/tests/base.rs`.
+
+---
+
 ## Known gaps
 
 - **Arc order in two blocks** (`B_GM_MainMenu`, `B_PLST_Main`). The
