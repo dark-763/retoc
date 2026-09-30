@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 use std::io::Seek;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{Cursor, Read, SeekFrom, Write},
     marker::PhantomData,
 };
@@ -31,10 +30,12 @@ pub struct FIoContainerHeader {
     // Legacy UE4 culture map (also known as localized package map) and package redirects (without source package name information)
     legacy_culture_package_map: FCulturePackageMap,
     legacy_package_redirects: Vec<LegacyContainerHeaderPackageRedirect>,
-    // HashSet for IDs of the localized packages, since they only need to be added once
-    localized_source_package_ids: HashSet<FPackageId>,
+    // IDs of the localized packages, since they only need to be added once.
+    // Ordered, like the lookup below: `unpack-raw` writes this struct into manifest.json,
+    // and a hash set or map would come out in a different order on every run.
+    localized_source_package_ids: BTreeSet<FPackageId>,
     // Package redirect lookup table, from source package ID to the redirected package ID
-    package_redirect_lookup: HashMap<FPackageId, FPackageId>,
+    package_redirect_lookup: BTreeMap<FPackageId, FPackageId>,
 }
 impl Readable for FIoContainerHeader {
     fn de<S: Read>(s: &mut S) -> Result<Self> {
@@ -131,7 +132,6 @@ impl FIoContainerHeader {
             new.localized_source_package_ids = new.package_redirects.iter().map(|x| x.source_package_id).collect();
 
             // Populate package redirects lookup from the package redirect list
-            new.package_redirect_lookup.reserve(new.package_redirects.len());
             for redirect_entry in &new.package_redirects {
                 new.package_redirect_lookup.insert(redirect_entry.source_package_id, redirect_entry.target_package_id);
             }
@@ -140,7 +140,6 @@ impl FIoContainerHeader {
             new.legacy_package_redirects = s.de()?;
 
             // Populate package redirects lookup from the legacy package redirect list
-            new.package_redirect_lookup.reserve(new.legacy_package_redirects.len());
             for redirect_entry in &new.legacy_package_redirects {
                 new.package_redirect_lookup.insert(redirect_entry.source_package_id, redirect_entry.target_package_id);
             }
@@ -243,8 +242,8 @@ impl FIoContainerHeader {
             soft_package_references: None,
             legacy_culture_package_map: FCulturePackageMap::default(),
             legacy_package_redirects: vec![],
-            localized_source_package_ids: HashSet::new(),
-            package_redirect_lookup: HashMap::new(),
+            localized_source_package_ids: BTreeSet::new(),
+            package_redirect_lookup: BTreeMap::new(),
         }
     }
 
