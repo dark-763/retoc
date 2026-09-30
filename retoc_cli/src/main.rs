@@ -135,6 +135,9 @@ struct ActionToLegacy {
     /// Do not output any files (dry run). Useful for testing conversion
     #[arg(short, long)]
     dry_run: bool,
+    /// Exit successfully even if some of the packages failed to convert
+    #[arg(long)]
+    allow_partial: bool,
 
     /// Engine version override
     #[arg(long)]
@@ -175,6 +178,10 @@ struct ActionToZen {
     /// Allows specifying additional Verse script cells to be considered for verse native cell import resolution
     #[arg(long)]
     script_cell: Vec<VerseScriptCell>,
+
+    /// Convert what can be converted even if some assets have to be skipped
+    #[arg(long)]
+    allow_partial: bool,
 
     /// Verbose logging
     #[arg(short, long)]
@@ -846,10 +853,18 @@ fn action_pack_raw(args: ActionPackRaw, _config: Arc<Config>) -> Result<()> {
     Ok(())
 }
 
+/// How many packages `to-legacy` was asked to convert and how many of them it could not.
+struct ToLegacyOutcome {
+    packages: usize,
+    failed: usize,
+}
+
 fn action_to_legacy(args: ActionToLegacy, config: Arc<Config>) -> Result<()> {
     let log = Log::new_stdout(args.verbose, args.debug);
-    if args.dry_run {
-        action_to_legacy_inner(args, config, &NullFileWriter, &log)?;
+    let allow_partial = args.allow_partial;
+    let output = args.output.clone();
+    let outcome = if args.dry_run {
+        action_to_legacy_inner(args, config, &NullFileWriter, &log)?
     } else if args.output.extension() == Some(std::ffi::OsStr::new("pak")) {
         let mut file = BufWriter::new(fs::File::create(&args.output)?);
         let mut pak = repak::PakBuilder::new().compression([repak::Compression::Oodle]).writer(
@@ -876,23 +891,40 @@ fn action_to_legacy(args: ActionToLegacy, config: Arc<Config>) -> Result<()> {
             }
             Ok(())
         })?;
-        result.unwrap()?; // unwrap action result and return error if occured
+        let outcome = result.unwrap()?; // unwrap action result and return error if occured
 
         pak.write_index()?;
+        outcome
     } else {
         let file_writer = FSFileWriter::new(&args.output);
-        action_to_legacy_inner(args, config, &file_writer, &log)?;
+        action_to_legacy_inner(args, config, &file_writer, &log)?
+    };
+
+    // Some packages failing is a failure of the run. It used to be a number in an info
+    // line on stdout and an exit code of zero, which a calling script reads as "all
+    // extracted". The packages that did convert are written either way - the output is
+    // finished before this is reported, so it stays usable for whoever passes
+    // --allow-partial or chooses to look at it after the error.
+    if outcome.failed > 0 {
+        let summary = format!("{} of {} packages failed to convert, the other {} were written to {:?}", outcome.failed, outcome.packages, outcome.packages - outcome.failed, output);
+        if allow_partial {
+            eprintln!("warning: {summary} (accepted by --allow-partial)");
+        } else {
+            bail!("{summary}. The reason for each is printed above. Pass --allow-partial to accept a partial result.");
+        }
     }
 
     Ok(())
 }
 
-fn action_to_legacy_inner(args: ActionToLegacy, config: Arc<Config>, file_writer: &dyn FileWriterTrait, log: &Log) -> Result<()> {
+fn action_to_legacy_inner(args: ActionToLegacy, config: Arc<Config>, file_writer: &dyn FileWriterTrait, log: &Log) -> Result<ToLegacyOutcome> {
     let iostore = iostore::open(&args.input, config.clone())?;
     let mut matched = 0usize;
     let mut ran = false;
+    let mut outcome = ToLegacyOutcome { packages: 0, failed: 0 };
     if !args.no_assets {
-        matched += action_to_legacy_assets(&args, file_writer, &*iostore, log)?;
+        outcome = action_to_legacy_assets(&args, file_writer, &*iostore, log)?;
+        matched += outcome.packages;
         ran = true;
     }
     if !args.no_shaders {
@@ -923,14 +955,14 @@ fn action_to_legacy_inner(args: ActionToLegacy, config: Arc<Config>, file_writer
             args.input
         );
     }
-    Ok(())
+    Ok(outcome)
 }
 
 fn progress_style() -> indicatif::ProgressStyle {
     indicatif::ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {wide_msg}").unwrap().progress_chars("##-")
 }
 
-fn action_to_legacy_assets(args: &ActionToLegacy, file_writer: &dyn FileWriterTrait, iostore: &dyn IoStoreTrait, log: &Log) -> Result<usize> {
+fn action_to_legacy_assets(args: &ActionToLegacy, file_writer: &dyn FileWriterTrait, iostore: &dyn IoStoreTrait, log: &Log) -> Result<ToLegacyOutcome> {
     let mut packages_to_extract = vec![];
     for package_info in iostore.packages() {
         let chunk_id = FIoChunkId::from_package_id(package_info.id(), 0, EIoChunkType::ExportBundleData);
@@ -984,8 +1016,9 @@ fn action_to_legacy_assets(args: &ActionToLegacy, file_writer: &dyn FileWriterTr
     let failed_count = failed_count.load(Ordering::SeqCst);
     info!(log, "Extracted {} ({failed_count} failed) legacy assets to {:?}", count - failed_count, args.output);
 
-    // Individual failures are tolerated on purpose - one unconvertible asset should not
-    // cost the other seventeen thousand. Every asset failing is a different thing: the
+    // Individual failures do not stop the run - one unconvertible asset should not cost
+    // the other seventeen thousand - but they are handed back to the caller, which turns
+    // them into a non-zero exit code. Every asset failing is a different thing: the
     // conversion did nothing at all and used to say so only in an info line, returning
     // success. That is how a run against a container without its global.utoc alongside -
     // where no script import resolves and so every package fails - was taken for a
@@ -997,7 +1030,7 @@ fn action_to_legacy_assets(args: &ActionToLegacy, file_writer: &dyn FileWriterTr
         );
     }
 
-    Ok(count)
+    Ok(ToLegacyOutcome { packages: count, failed: failed_count })
 }
 
 fn action_to_legacy_shaders(args: &ActionToLegacy, file_writer: &dyn FileWriterTrait, iostore: &dyn IoStoreTrait, log: &Log) -> Result<usize> {
@@ -1041,6 +1074,8 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
     // whole container or its global bundle numbering is meaningless.
     let mut all_asset_paths = vec![];
     let mut shader_lib_paths = vec![];
+    // Assets matched by the filter that cannot be converted: no split exports file
+    let mut skipped_asset_paths = vec![];
     let mut script_objects: Option<Arc<ZenScriptObjects>> = None;
 
     let check_path = |path: &UEPath| {
@@ -1070,6 +1105,7 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
                 asset_paths.push(path);
             } else {
                 info!(&log, "Skipping {path} because it does not have a split exports file. Are you sure the package is cooked?");
+                skipped_asset_paths.push(path);
             }
         }
         let is_shader_lib = Some("ushaderbytecode") == ext;
@@ -1103,6 +1139,23 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
             input_path,
             files.len()
         );
+    }
+
+    // An asset left out is a package missing from the container. It used to be one info
+    // line among thousands and an exit code of zero. Checked before the writer exists,
+    // for the same reason as above: nothing is written, nothing is truncated.
+    if !skipped_asset_paths.is_empty() {
+        let summary = format!(
+            "{} of {} assets cannot be converted: no .uexp next to the .uasset or .umap (first: {})",
+            skipped_asset_paths.len(),
+            skipped_asset_paths.len() + asset_paths.len(),
+            skipped_asset_paths[0]
+        );
+        if args.allow_partial {
+            eprintln!("warning: {summary}. Converting the rest (--allow-partial)");
+        } else {
+            bail!("{summary}. Nothing was written. Pass --allow-partial to convert the rest without them.");
+        }
     }
 
     // The writer is created only once the input is known to be worth converting: it
