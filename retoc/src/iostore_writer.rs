@@ -3,7 +3,7 @@ use crate::{
     chunk_id::FIoChunkIdRaw,
     container_header::{EIoContainerHeaderVersion, FIoContainerHeader, StoreEntry},
 };
-use crate::{EIoStoreTocVersion, FIoChunkId, FIoContainerId, FIoOffsetAndLength, FIoStoreTocCompressedBlockEntry, FIoStoreTocEntryMeta, FIoStoreTocEntryMetaFlags, Toc, ser::*};
+use crate::{EIoStoreTocVersion, FIoChunkHash, FIoChunkId, FIoContainerId, FIoOffsetAndLength, FIoStoreTocCompressedBlockEntry, FIoStoreTocEntryMeta, FIoStoreTocEntryMetaFlags, Toc, ser::*};
 use crate::compression::{CompressionMethod, compress};
 use anyhow::{Context, Result};
 use fs_err as fs;
@@ -38,6 +38,60 @@ fn compression_pool() -> &'static rayon::ThreadPool {
             .build()
             .expect("failed to build the compression thread pool")
     })
+}
+
+/// Everything about a chunk that can be worked out without the writer: its hash and its
+/// compression blocks. Working it out is the expensive part of writing a chunk, and it
+/// depends on nothing but the chunk's own bytes, so it can be done for many chunks at
+/// once on other threads while the writer appends them one by one, in order.
+pub struct PreparedChunk {
+    hash: FIoChunkHash,
+    /// One entry per block of the data, in order. `None` means "write the block as it
+    /// is": a block is stored compressed only when that makes it smaller.
+    blocks: Vec<Option<Vec<u8>>>,
+    data_len: usize,
+}
+
+/// The settings of a writer that preparing a chunk depends on. Small and `Copy`, so it
+/// can be handed to worker threads while the writer itself stays with the thread that
+/// writes.
+#[derive(Clone, Copy)]
+pub struct ChunkPreparer {
+    version: EIoStoreTocVersion,
+    block_size: usize,
+    method: Option<CompressionMethod>,
+}
+impl ChunkPreparer {
+    pub fn prepare(&self, data: &[u8]) -> PreparedChunk {
+        // Хеш считается по несжатым данным - так же, как в оригинале. Функция зависит
+        // от версии контейнера: до UE 5.5 это SHA-1, дальше blake3.
+        let hash = crate::hash_chunk(self.version, data);
+
+        // Блоки сжимаются параллельно, а пишутся строго по порядку. Раньше и то и
+        // другое шло одним последовательным циклом: 18 ГБ порциями по 64 КБ на одном
+        // ядре из шестнадцати, и это была основная часть времени сборки контейнера.
+        //
+        // `None` означает "писать блок как есть": блок сжимается, только если это
+        // даёт выигрыш, неужавшиеся пишутся с методом 0 - оригинальный кукер
+        // поступает так же.
+        let block_size = self.block_size;
+        let blocks: Vec<Option<Vec<u8>>> = match self.method {
+            Some(method) => compression_pool().install(|| {
+                data.par_chunks(block_size)
+                    .map(|block| {
+                        let mut buffer: Vec<u8> = Vec::new();
+                        if compress(method, block, Cursor::new(&mut buffer)).is_ok() && buffer.len() < block.len() {
+                            Some(buffer)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }),
+            None => Vec::new(),
+        };
+        PreparedChunk { hash, blocks, data_len: data.len() }
+    }
 }
 
 pub struct IoStoreWriter {
@@ -118,7 +172,25 @@ impl IoStoreWriter {
     pub fn write_chunk_raw(&mut self, chunk_id_raw: FIoChunkIdRaw, path: Option<&UEPath>, data: &[u8]) -> Result<()> {
         self.write_chunk(FIoChunkId::from_raw(chunk_id_raw, self.toc.version), path, data)
     }
+    /// What worker threads need to prepare chunks for this writer.
+    ///
+    /// Taken once the compression method is settled: a chunk prepared before
+    /// `use_compression_method_if_unset` would be prepared for the wrong method.
+    pub fn chunk_preparer(&self) -> ChunkPreparer {
+        ChunkPreparer {
+            version: self.toc.version,
+            block_size: self.toc.compression_block_size as usize,
+            method: self.compression_method,
+        }
+    }
     pub fn write_chunk(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8]) -> Result<()> {
+        let prepared = self.chunk_preparer().prepare(data);
+        self.write_prepared_chunk(chunk_id, path, data, prepared)
+    }
+    /// Appends a chunk whose hash and compression were worked out beforehand by
+    /// [`ChunkPreparer::prepare`] over the same `data`.
+    pub fn write_prepared_chunk(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8], prepared: PreparedChunk) -> Result<()> {
+        anyhow::ensure!(prepared.data_len == data.len(), "a chunk of {} bytes was prepared from {} bytes of data", data.len(), prepared.data_len);
         if let Some(path) = path {
             let index = &mut self.toc.directory_index;
             let relative_path = path.strip_prefix(&index.mount_point).with_context(|| format!("mount point {} does not contain path {path}", index.mount_point))?;
@@ -129,35 +201,9 @@ impl IoStoreWriter {
 
         let start_block = self.toc.compression_blocks.len();
 
-        // Хеш считается по несжатым данным - так же, как в оригинале. Функция зависит
-        // от версии контейнера: до UE 5.5 это SHA-1, дальше blake3.
-        let chunk_hash = crate::hash_chunk(self.toc.version, data);
-
+        let chunk_hash = prepared.hash;
         let block_size = self.toc.compression_block_size as usize;
-        let method = self.compression_method;
-
-        // Блоки сжимаются параллельно, а пишутся строго по порядку. Раньше и то и
-        // другое шло одним последовательным циклом: 18 ГБ порциями по 64 КБ на одном
-        // ядре из шестнадцати, и это была основная часть времени сборки контейнера.
-        //
-        // `None` означает "писать блок как есть": блок сжимается, только если это
-        // даёт выигрыш, неужавшиеся пишутся с методом 0 - оригинальный кукер
-        // поступает так же.
-        let compressed: Vec<Option<Vec<u8>>> = match method {
-            Some(method) => compression_pool().install(|| {
-                data.par_chunks(block_size)
-                    .map(|block| {
-                        let mut buffer: Vec<u8> = Vec::new();
-                        if compress(method, block, Cursor::new(&mut buffer)).is_ok() && buffer.len() < block.len() {
-                            Some(buffer)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            }),
-            None => Vec::new(),
-        };
+        let compressed = prepared.blocks;
 
         let mut any_block_compressed = false;
         for (index, block) in data.chunks(block_size).enumerate() {
@@ -195,9 +241,13 @@ impl IoStoreWriter {
     }
 
     pub fn write_package_chunk(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8], store_entry: &StoreEntry) -> Result<()> {
+        let prepared = self.chunk_preparer().prepare(data);
+        self.write_prepared_package_chunk(chunk_id, path, data, store_entry, prepared)
+    }
+    pub fn write_prepared_package_chunk(&mut self, chunk_id: FIoChunkId, path: Option<&UEPath>, data: &[u8], store_entry: &StoreEntry, prepared: PreparedChunk) -> Result<()> {
         let container_header = self.container_header.as_mut().expect("FIoContainerHeader is required to write package chunks");
         container_header.add_package(FPackageId(chunk_id.get_chunk_id()), store_entry.clone());
-        self.write_chunk(chunk_id, path, data)
+        self.write_prepared_chunk(chunk_id, path, data, prepared)
     }
     pub fn add_localized_package(&mut self, package_culture: &str, source_package_name: &str, localized_package_id: FPackageId) -> Result<()> {
         let container_header = self.container_header.as_mut().expect("FIoContainerHeader is required to add localized packages");

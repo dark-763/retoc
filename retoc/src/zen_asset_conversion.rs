@@ -1647,10 +1647,29 @@ impl ConvertedZenAssetBundle {
         Ok(())
     }
 
+    /// The packages whose export bundles this package's external arcs point into. The
+    /// fix-up needs each of them converted; one that is not given to it is taken for a
+    /// package outside the container.
+    pub fn external_arc_source_packages(&self) -> impl Iterator<Item = FPackageId> + '_ {
+        self.legacy_external_arc_fixup_data.iter().map(|x| x.from_package_id)
+    }
+
+    /// The package chunk as it will be written. Final only after the fix-up.
+    pub fn package_data(&self) -> &[u8] {
+        &self.package_buffer
+    }
+
     // Writes package data into the container, and releases the reference to it
     pub fn write_package_data(&mut self, writer: &mut IoStoreWriter) -> anyhow::Result<()> {
+        let prepared = writer.chunk_preparer().prepare(&self.package_buffer);
+        self.write_prepared_package_data(writer, prepared)
+    }
+
+    /// Same as `write_package_data`, with the hash and the compression of the chunk
+    /// done beforehand - on another thread - over `package_data()`.
+    pub fn write_prepared_package_data(&mut self, writer: &mut IoStoreWriter, prepared: crate::iostore_writer::PreparedChunk) -> anyhow::Result<()> {
         let package_chunk_id = FIoChunkId::from_package_id(self.package_id, 0, EIoChunkType::ExportBundleData);
-        writer.write_package_chunk(package_chunk_id, Some(&self.path), &self.package_buffer, &self.store_entry)?;
+        writer.write_prepared_package_chunk(package_chunk_id, Some(&self.path), &self.package_buffer, &self.store_entry, prepared)?;
 
         // Add the localized package entry if this is a localized package
         if let Some(package_culture_name) = &self.localized_package_culture_name {

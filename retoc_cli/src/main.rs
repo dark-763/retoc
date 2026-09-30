@@ -1304,9 +1304,22 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
             info!(log, "Writing converted assets");
             prog_ref.inspect(|x| x.set_position(0));
 
-            // Write all the package data for each asset once fixups are complete
-            for converted in &all_converted {
-                converted.write().unwrap().write_package_data(&mut writer)?;
+            // Write all the package data for each asset once fixups are complete.
+            //
+            // Hashing and compressing a chunk needs only the chunk, so that part runs on
+            // the worker threads, several chunks at a time; the writer appends the
+            // results in the order of the list. It used to be one chunk after another
+            // on a single thread, and with some eighteen thousand small chunks that was
+            // about half of the whole conversion.
+            let preparer = writer.chunk_preparer();
+            let prepare = move |converted: Arc<RwLock<ConvertedZenAssetBundle>>| preparer.prepare(converted.read().unwrap().package_data());
+            let prepared_in_order: Box<dyn Iterator<Item = retoc::iostore_writer::PreparedChunk>> = if args.no_parallel {
+                Box::new(all_converted.clone().into_iter().map(prepare))
+            } else {
+                Box::new(all_converted.clone().into_iter().parallel_map_scoped_custom(scope, |options| options.threads(threads).buffer_size(threads * 2), prepare))
+            };
+            for (converted, prepared) in all_converted.iter().zip(prepared_in_order) {
+                converted.write().unwrap().write_prepared_package_data(&mut writer, prepared)?;
                 prog_ref.inspect(|x| x.inc(1));
             }
         } else {
