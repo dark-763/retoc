@@ -1268,6 +1268,7 @@ dependencies = [
  "indicatif",
  "itertools",
  "jmap",
+ "pariter",
  "rayon",
  "repak",
  "retoc",

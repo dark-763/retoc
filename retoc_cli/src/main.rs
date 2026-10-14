@@ -537,7 +537,7 @@ fn action_unpack(args: ActionUnpack, config: Arc<Config>) -> Result<()> {
 }
 
 mod raw {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -545,7 +545,8 @@ mod raw {
 
     #[derive(Serialize, Deserialize)]
     pub(crate) struct RawIoManifest {
-        pub(crate) chunk_paths: HashMap<ChunkId, String>,
+        // Ordered, so that manifest.json is the same file on every run
+        pub(crate) chunk_paths: BTreeMap<ChunkId, String>,
         pub(crate) version: EIoStoreTocVersion,
         pub(crate) mount_point: String,
     }
@@ -610,11 +611,18 @@ fn action_pack_raw(args: ActionPackRaw, _config: Arc<Config>) -> Result<()> {
     let manifest: raw::RawIoManifest = serde_json::from_reader(BufReader::new(fs::File::open(args.input.join("manifest.json"))?))?;
 
     let mut writer = IoStoreWriter::new(args.utoc, manifest.version, None, manifest.mount_point.into())?;
+    let mut chunk_files = vec![];
     for entry in args.input.join("chunks").read_dir()? {
         let entry = entry?;
         let chunk_id = FIoChunkIdRaw::from_str(entry.file_name().to_string_lossy().as_ref())?;
+        chunk_files.push((chunk_id, entry.path()));
+    }
+    // Chunks are written in the order of this list. A directory listing comes in whatever
+    // order the file system keeps it, so sort by chunk id to get the same container anywhere.
+    chunk_files.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+    for (chunk_id, file) in chunk_files {
         let path = manifest.chunk_paths.get(&chunk_id.into()).map(UEPath::new);
-        let data = fs::read(entry.path())?;
+        let data = fs::read(file)?;
         writer.write_chunk_raw(chunk_id, path, &data)?;
     }
     writer.finalize()?;
@@ -785,7 +793,10 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
         if args.filter.is_empty() { true } else { args.filter.iter().any(|f| path.as_str().contains(f)) }
     };
 
-    let files = input.list_files()?;
+    // Sorted, because everything below is written in the order of this list, and the listing
+    // itself comes in whatever order the file system or the .pak index has
+    let mut files = input.list_files()?;
+    files.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     let files_set: HashSet<&UEPathBuf> = HashSet::from_iter(files.iter());
 
     for path in &files {
@@ -843,48 +854,50 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
     // Decide whenever we need all packages to be in memory at the same time to perform the fixup or not
     let needs_asset_import_fixup = container_header_version <= EIoContainerHeaderVersion::Initial;
 
-    let process_assets = |tx: std::sync::mpsc::SyncSender<ConvertedZenAssetBundle>| -> Result<()> {
-        let process = |path: &&UEPathBuf| -> Result<()> {
-            verbose!(&log, "converting asset {path}");
+    let convert = |path: &UEPathBuf| -> Result<ConvertedZenAssetBundle> {
+        verbose!(&log, "converting asset {path}");
 
-            prog_ref.inspect(|p| p.set_message(path.to_string()));
+        prog_ref.inspect(|p| p.set_message(path.to_string()));
 
-            let bundle = FSerializedAssetBundle {
-                asset_file_buffer: input.read(path)?,
-                exports_file_buffer: input.read(&path.with_extension("uexp"))?,
-                bulk_data_buffer: input.read_opt(&path.with_extension("ubulk"))?,
-                optional_bulk_data_buffer: input.read_opt(&path.with_extension("uptnl"))?,
-                memory_mapped_bulk_data_buffer: input.read_opt(&path.with_extension("m.ubulk"))?,
-            };
-
-            let converted = zen_asset_conversion::build_zen_asset(
-                bundle,
-                &package_name_to_referenced_shader_maps,
-                &mount_point.join(path),
-                Some(args.version.package_file_version()),
-                container_header_version,
-                needs_asset_import_fixup,
-                script_objects.clone(),
-                Some(script_cell_store.clone()),
-                &log,
-            )?;
-
-            tx.send(converted)?;
-
-            prog_ref.inspect(|p| p.inc(1));
-            Ok(())
+        let bundle = FSerializedAssetBundle {
+            asset_file_buffer: input.read(path)?,
+            exports_file_buffer: input.read(&path.with_extension("uexp"))?,
+            bulk_data_buffer: input.read_opt(&path.with_extension("ubulk"))?,
+            optional_bulk_data_buffer: input.read_opt(&path.with_extension("uptnl"))?,
+            memory_mapped_bulk_data_buffer: input.read_opt(&path.with_extension("m.ubulk"))?,
         };
 
-        if args.no_parallel { asset_paths.iter().try_for_each(process) } else { asset_paths.par_iter().try_for_each(process) }
-    };
-    let mut result = None;
-    let result_ref = &mut result;
-    rayon::in_place_scope(|scope| -> Result<()> {
-        let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        let converted = zen_asset_conversion::build_zen_asset(
+            bundle,
+            &package_name_to_referenced_shader_maps,
+            &mount_point.join(path),
+            Some(args.version.package_file_version()),
+            container_header_version,
+            needs_asset_import_fixup,
+            script_objects.clone(),
+            Some(script_cell_store.clone()),
+            &log,
+        )?;
 
-        scope.spawn(|_| {
-            *result_ref = Some(process_assets(tx));
-        });
+        prog_ref.inspect(|p| p.inc(1));
+        Ok(converted)
+    };
+
+    // Packages are converted in parallel, but reach the writer in the order of `asset_paths`,
+    // which is sorted. Everything in the container follows the order of writing (chunk data in
+    // the .ucas, the chunk tables and the directory index in the .utoc), so taking them in the
+    // order the worker threads finished gave a different container on every run.
+    // At most `2 * threads` converted packages wait for their turn, which keeps memory bounded
+    // when one large package holds up the ones after it.
+    let threads = rayon::current_num_threads();
+    pariter::scope(|scope| -> Result<()> {
+        use pariter::IteratorExt as _;
+
+        let converted_in_order: Box<dyn Iterator<Item = Result<ConvertedZenAssetBundle>> + '_> = if args.no_parallel {
+            Box::new(asset_paths.iter().copied().map(convert))
+        } else {
+            Box::new(asset_paths.iter().copied().parallel_map_scoped_custom(scope, |options| options.threads(threads).buffer_size(threads * 2), convert))
+        };
 
         if needs_asset_import_fixup {
             let mut converted_lookup: HashMap<FPackageId, Arc<RwLock<ConvertedZenAssetBundle>>> = HashMap::new();
@@ -892,7 +905,8 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
             let mut total_package_data_size: usize = 0;
 
             // Collect all assets into the lookup map first, and also into the processing list
-            for mut converted in rx {
+            for converted in converted_in_order {
+                let mut converted = converted?;
                 // Write and release bulk data immediately, we do not have enough RAM to keep all the bulk data for all the packages in memory at the same time
                 converted.write_and_release_bulk_data(&mut writer)?;
                 total_package_data_size += converted.package_data_size();
@@ -921,13 +935,13 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
             }
         } else {
             // Write the assets immediately otherwise as they are processed
-            for mut converted in rx {
-                converted.write(&mut writer)?;
+            for converted in converted_in_order {
+                converted?.write(&mut writer)?;
             }
         }
         Ok(())
-    })?;
-    result.unwrap()?;
+    })
+    .map_err(|_| anyhow::anyhow!("a conversion thread panicked"))??;
 
     prog_ref.inspect(|p| p.finish_with_message(""));
     log.set_progress(None);
