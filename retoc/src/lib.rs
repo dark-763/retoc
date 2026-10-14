@@ -578,6 +578,10 @@ impl Toc {
         Self::default()
     }
     /// get absolute path (including mount point) for given chunk ID if has one
+    /// Mount point of the directory index, e.g. "../../../"; empty if the container has no directory index
+    pub fn mount_point(&self) -> &str {
+        self.directory_index.mount_point.as_str()
+    }
     pub fn file_name(&self, chunk_id: FIoChunkId) -> Option<String> {
         self.chunk_id_map
             .get(&chunk_id.with_version(self.version))

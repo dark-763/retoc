@@ -79,6 +79,7 @@ struct ActionVerify {
 
 #[derive(Parser, Debug)]
 struct ActionUnpack {
+    /// Input .utoc or directory with .utoc files (e.g. Content/Paks/)
     #[arg(index = 1)]
     utoc: PathBuf,
     #[arg(index = 2)]
@@ -506,19 +507,56 @@ fn action_verify(args: ActionVerify, config: Arc<Config>) -> Result<()> {
 }
 
 fn action_unpack(args: ActionUnpack, config: Arc<Config>) -> Result<()> {
-    let mut stream = BufReader::new(fs::File::open(&args.utoc)?);
-    let ucas = &args.utoc.with_extension("ucas");
+    if !args.utoc.is_dir() {
+        return unpack_container(&args.utoc, &args.output, args.verbose, config);
+    }
+    // Every .utoc of the directory into the same output, in name order: a patch container
+    // (name ending in _P) comes after its base, so its files replace the base ones
+    let mut tocs = vec![];
+    for entry in fs::read_dir(&args.utoc)? {
+        let path = entry?.path();
+        if path.extension() == Some(OsStr::new("utoc")) {
+            tocs.push(path);
+        }
+    }
+    if tocs.is_empty() {
+        bail!("no .utoc files in {:?}", args.utoc);
+    }
+    tocs.sort();
+    for utoc in &tocs {
+        unpack_container(utoc, &args.output, args.verbose, config.clone())?;
+    }
+    Ok(())
+}
+
+/// The directory under the output that the files of a container go to: its mount point without
+/// the leading "../" parts, so that the files keep the directories above them
+/// ("../../../Game/Content/Mods/X/" -> "Game/Content/Mods/X")
+fn mount_point_dir(mount_point: &str) -> Result<PathBuf> {
+    let mut dir = PathBuf::new();
+    for part in mount_point.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".").skip_while(|p| *p == "..") {
+        if part == ".." || part.contains(':') {
+            bail!("unsupported mount point {mount_point:?}");
+        }
+        dir.push(part);
+    }
+    Ok(dir)
+}
+
+fn unpack_container(utoc: &Path, output: &Path, verbose: bool, config: Arc<Config>) -> Result<()> {
+    let mut stream = BufReader::new(fs::File::open(utoc)?);
+    let ucas = &utoc.with_extension("ucas");
 
     let toc: Toc = stream.de_ctx(config)?;
 
-    let output = args.output;
+    let output = output.join(mount_point_dir(toc.mount_point())?);
 
     // TODO extract entries not found in directory index
     // TODO output chunk id manifest
     toc.file_map.keys().par_bridge().try_for_each_init(
         || BufReader::new(fs::File::open(ucas).unwrap()),
         |ucas, file_name| -> Result<()> {
-            if args.verbose {
+            if verbose {
                 println!("{file_name}");
             }
             let data = toc.read(ucas, toc.file_map[file_name])?;
@@ -576,6 +614,15 @@ mod raw {
 }
 
 fn action_unpack_raw(args: ActionUnpackRaw, config: Arc<Config>) -> Result<()> {
+    // Keep the mount point of the container, so that pack-raw writes it back as it was.
+    // A directory of containers, or a container without a directory index, has none of its own.
+    let mount_point = if args.utoc.is_file() {
+        let toc: Toc = BufReader::new(fs::File::open(&args.utoc)?).de_ctx(config.clone())?;
+        toc.mount_point().to_string()
+    } else {
+        String::new()
+    };
+    let mount_point = if mount_point.is_empty() { "../../../".to_string() } else { mount_point };
     let iostore = iostore::open(args.utoc, config)?;
 
     let output = args.output;
@@ -588,7 +635,7 @@ fn action_unpack_raw(args: ActionUnpackRaw, config: Arc<Config>) -> Result<()> {
     let mut manifest = raw::RawIoManifest {
         chunk_paths: Default::default(),
         version: iostore.container_file_version().unwrap(),
-        mount_point: "../../../".to_string(),
+        mount_point,
     };
 
     for chunk in iostore.chunks() {
